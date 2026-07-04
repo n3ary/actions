@@ -1,0 +1,97 @@
+name: 'Auto-bump version on PR'
+description: 'Bumps package.json#version on the PR branch to main+1, preserving pre-release tags. Returns the bumped version + whether anything actually changed.'
+author: 'n3ary'
+
+inputs:
+  bump-skip-paths:
+    description: 'Comma-separated paths that, when changed alone, should skip the bump.'
+    required: false
+    default: '.github/,docs/,.gitignore,LICENSE'
+  commit-message:
+    description: 'Commit message. {version} is replaced with the new version.'
+    required: false
+    default: 'chore(release): auto-bump to v{version}'
+  base-ref:
+    description: 'Base ref to compare against. Defaults to the workflow base ref.'
+    required: false
+    default: ''
+
+outputs:
+  previous-version:
+    description: 'The version on origin/<base> before the bump.'
+  next-version:
+    description: 'The version after the bump (matches the new package.json#version).'
+  bumped:
+    description: '"true" if the version was bumped; "false" if skipped (metadata-only diff or already correct).'
+
+runs:
+  using: composite
+  steps:
+    - name: Skip if metadata-only diff
+      id: skip-check
+      shell: bash
+      env:
+        BUMP_SKIP_PATHS: ${{ inputs.bump-skip-paths }}
+      run: |
+        BASE="${BASE_REF:-${GITHUB_BASE_REF:-main}}"
+        CHANGED=$(git diff --name-only "origin/${BASE}"...HEAD)
+        # Build a regex of paths to skip
+        SKIP_RE=$(printf '%s' "$BUMP_SKIP_PATHS" | tr ',' '\n' | sed 's:.*:^&:; s:/$::' | paste -sd'|' -)
+        NON_META=$(echo "$CHANGED" | grep -vE "$SKIP_RE" || true)
+        if [ -z "$NON_META" ]; then
+          echo "Only metadata changes — skipping version bump."
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Compute next version
+      id: compute
+      if: steps.skip-check.outputs.skip != 'true'
+      shell: bash
+      run: |
+        BASE="${BASE_REF:-${GITHUB_BASE_REF:-main}}"
+        MAIN_VERSION=$(git show "origin/${BASE}:package.json" | node -p "JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).version")
+        # Increment patch; preserve pre-release suffix.
+        # Handles: 1.5.68 → 1.5.69, 0.2.0-m1 → 0.2.1-m1, 1.0.0-alpha.1 → 1.0.1-alpha.1, 0.2.0-rc.1+build.5 → 0.2.1-rc.1+build.5.
+        NEXT=$(node -e '
+          const v = process.argv[1].match(/^(\d+)\.(\d+)\.(\d+)(-.+)?$/);
+          if (!v) { console.error("Unparseable version:", process.argv[1]); process.exit(1); }
+          const [, major, minor, patchStr, prerelease = ""] = v;
+          console.log(`${major}.${minor}.${Number(patchStr) + 1}${prerelease}`);
+        ' "$MAIN_VERSION")
+        CURRENT=$(node -p "require('./package.json').version")
+        echo "From $MAIN_VERSION → $NEXT (PR branch: $CURRENT)"
+        echo "previous=$MAIN_VERSION" >> "$GITHUB_OUTPUT"
+        echo "next=$NEXT" >> "$GITHUB_OUTPUT"
+
+    - name: Apply bump (commit + push)
+      id: apply
+      if: steps.skip-check.outputs.skip != 'true'
+      shell: bash
+      run: |
+        NEXT="${{ steps.compute.outputs.next }}"
+        CURRENT=$(node -p "require('./package.json').version")
+        if [ "$CURRENT" != "$NEXT" ]; then
+          echo "Bumping $CURRENT → $NEXT"
+          npm version "$NEXT" --no-git-tag-version
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          MSG=$(echo "${{ inputs.commit-message }}" | sed "s/{version}/$NEXT/")
+          git add package.json
+          git commit -m "$MSG"
+          git push
+          echo "bumped=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "Version already correct ($CURRENT), skipping bump"
+          echo "bumped=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Mark as skipped
+      if: steps.skip-check.outputs.skip == 'true'
+      shell: bash
+      run: |
+        CURRENT=$(node -p "require('./package.json').version" 2>/dev/null || echo "")
+        echo "previous=${CURRENT}" >> "$GITHUB_OUTPUT"
+        echo "next=${CURRENT}" >> "$GITHUB_OUTPUT"
+        echo "bumped=false" >> "$GITHUB_OUTPUT"
