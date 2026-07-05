@@ -175,12 +175,14 @@ jobs:
           # Match: "chore(standards): vendor from <repo>@<7-char SHA>"
           VENDOR_RE="chore\(standards\): vendor from ${STANDARDS_REPO}@"
           while IFS= read -r subject; do
-            TARGET=$(echo "$subject" | grep -oP "${VENDOR_RE}\K[a-f0-9]+")
-            TARGET="${TARGET:-}"
-            [ -z "$TARGET" ] && continue
+            # grep -oP exits 1 when the pattern doesn't match (the
+            # common case for non-vendor commits), and `set -e` would
+            # otherwise abort the script. `|| true` swallows that.
+            T=$(echo "$subject" | grep -oP "${VENDOR_RE}\K[a-f0-9]+" || true)
+            [ -z "$T" ] && continue
             # Lexicographic compare works for fixed-length hex SHAs.
-            if [ "$TARGET" \< "$MAIN_VENDOR_SHA" ]; then
-              DOWNLEVEL="${DOWNLEVEL} ${TARGET}"
+            if [ "$T" \< "$MAIN_VENDOR_SHA" ]; then
+              DOWNLEVEL="${DOWNLEVEL} ${T}"
             fi
           done < <(git log "origin/${BASE}..HEAD" --no-merges --pretty=%s)
 
