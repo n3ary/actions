@@ -80,7 +80,26 @@ runs:
           MSG=$(echo "${{ inputs.commit-message }}" | sed "s/{version}/$NEXT/")
           git add package.json
           git commit -m "$MSG"
-          git push
+          # Race-safe push: a concurrent push (e.g. an admin merging
+          # main into the PR branch via the web UI) can land on the
+          # remote between this action's checkout and push. Plain
+          # `git push` then fails with "Updates were rejected ... fetch
+          # first". Rebase onto origin first; if that conflicts (e.g.
+          # origin also bumped version), reset to origin and let the
+          # re-computed NEXT apply cleanly on the new base.
+          BRANCH="${GITHUB_HEAD_REF:-$(git rev-parse --abbrev-ref HEAD)}"
+          git fetch origin "$BRANCH" --depth=1 2>/dev/null || true
+          if ! git merge-base --is-ancestor HEAD "origin/$BRANCH"; then
+            echo "Remote has new commits; rebasing local bump"
+            if git rebase "origin/$BRANCH" 2>/dev/null; then
+              echo "Rebased cleanly"
+            else
+              echo "Rebase conflicted (likely origin also bumped version); resetting and re-applying"
+              git rebase --abort || true
+              git reset --hard "origin/$BRANCH"
+            fi
+          fi
+          git push --force-with-lease
           echo "bumped=true" >> "$GITHUB_OUTPUT"
         else
           echo "Version already correct ($CURRENT), skipping bump"
