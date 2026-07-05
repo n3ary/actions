@@ -97,53 +97,18 @@ runs:
         " >> "$GITHUB_OUTPUT"
 
     - name: Install dependencies
-      env:
-        NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        HOME: >-
-          ${{ runner.temp }}/publish-adapter-${{ inputs.adapter }}-clean-home
-      shell: bash
-      run: |
-        # HOME-scoped .npmrc: the workspace's committed .npmrc maps
-        # @n3ary scope to GH Packages but does NOT carry the auth
-        # token. Writing a runner-temp .npmrc with _authToken from
-        # the NPM_TOKEN secret is the standard recipe (pnpm reads
-        # auth from .npmrc, not NODE_AUTH_TOKEN env).
-        #
-        # Same pattern as publish-spec.yml + publish-adapter.yml on
-        # n3ary/gtfs-publisher + n3ary/gtfs-adapters.
-        mkdir -p "$HOME"
-        {
-          echo "@n3ary:registry=https://npm.pkg.github.com"
-          echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}"
-        } > "$HOME/.npmrc"
-        pnpm install --frozen-lockfile --trust-lockfile
+      uses: n3ary/actions/.github/actions/setup-pnpm-gh-packages-auth@v14
+      with:
+        auth-token: ${{ secrets.NPM_TOKEN }}
 
     - name: Bump version (workflow_dispatch override path)
       if: inputs.version-override != ''
-      shell: bash
-      run: |
-        VERSION="${{ inputs.version-override }}"
-        if ! echo "$VERSION" | grep -qE \
-          '^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$'; then
-          echo "::error::Invalid version format: $VERSION"
-          exit 1
-        fi
-        cd "adapters/${{ inputs.adapter }}"
-        CURRENT=$(node -p "require('./package.json').version")
-        if [ "$CURRENT" != "$VERSION" ]; then
-          npm version "$VERSION" --no-git-tag-version
-          cd ../..
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "adapters/${{ inputs.adapter }}/package.json"
-          COMMIT_MSG="chore(release): ${{ steps.meta.outputs.name }}"
-          COMMIT_MSG="${COMMIT_MSG} v${VERSION}"
-          git commit -m "${COMMIT_MSG}"
-          echo "Bumped: $CURRENT -> $VERSION"
-        else
-          echo "Version already at $VERSION; skipping bump."
-        fi
-        echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+      uses: n3ary/actions/.github/actions/version-bump@v12
+      with:
+        version-input: ${{ inputs.version-override }}
+        package-dir: adapters/${{ inputs.adapter }}
+        tag-name: adapters/${{ inputs.adapter }}/v{version}
+        commit-message-override: 'chore(release): ${{ steps.meta.outputs.name }} v{version}'
 
     - name: Build adapter package
       shell: bash
