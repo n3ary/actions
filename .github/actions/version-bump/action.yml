@@ -1,41 +1,55 @@
 name: 'Auto-bump version on PR'
-description: 'Bumps package.json#version on the PR branch to main+1, preserving pre-release tags. Returns the bumped version + whether anything actually changed.'
+description: 'Bumps package.json#version on the PR branch, either auto-incrementing from main+1 (default) or to an explicit override (version-input). Preserves pre-release tags and commits pnpm-lock.yaml if dirty. Returns the bumped version + whether anything actually changed.'
 author: 'n3ary'
 
 inputs:
   bump-skip-paths:
-    description: 'Comma-separated paths that, when changed alone, should skip the bump.'
+    description: 'Comma-separated paths that, when changed alone, should skip the bump. Ignored when version-input is set.'
     required: false
     default: '.github/,docs/,.gitignore,LICENSE'
   commit-message:
-    description: 'Commit message. {version} is replaced with the new version.'
+    description: 'Commit message. {version} is replaced with the new version. Ignored when commit-message-override is set.'
     required: false
     default: 'chore(release): auto-bump to v{version}'
+  commit-message-override:
+    description: 'Full commit message override. Ignored when unset. Useful for publish flows that want a custom message.'
+    required: false
+    default: ''
   base-ref:
     description: 'Base ref to compare against. Defaults to the workflow base ref.'
     required: false
     default: ''
+  version-input:
+    description: 'Explicit target version (e.g. "0.3.4"). When set, skips auto-increment and uses this value. Used by publish flows (publish-spec, adapters/publish) that need a precise target rather than main+1. Ignores bump-skip-paths.'
+    required: false
+    default: ''
+  skip-commit:
+    description: 'Skip the commit + push (only compute + write to package.json). Used by callers that want to compose the commit themselves.'
+    required: false
+    default: 'false'
 
 outputs:
   previous-version:
-    description: 'The version on origin/<base> before the bump.'
+    description: 'The version on origin/<base> before the bump (or current version when version-input is set and matches).'
   next-version:
     description: 'The version after the bump (matches the new package.json#version).'
   bumped:
-    description: '"true" if the version was bumped; "false" if skipped (metadata-only diff or already correct).'
+    description: '"true" if the version was bumped; "false" if skipped (metadata-only diff, already correct, or version-input matched current).'
+  skipped:
+    description: '"true" if the action skipped (metadata-only diff OR version-input matched current).'
 
 runs:
   using: composite
   steps:
     - name: Skip if metadata-only diff
       id: skip-check
+      if: inputs.version-input == ''
       shell: bash
       env:
         BUMP_SKIP_PATHS: ${{ inputs.bump-skip-paths }}
       run: |
         BASE="${BASE_REF:-${GITHUB_BASE_REF:-main}}"
         CHANGED=$(git diff --name-only "origin/${BASE}"...HEAD)
-        # Build a regex of paths to skip
         SKIP_RE=$(printf '%s' "$BUMP_SKIP_PATHS" | tr ',' '\n' | sed 's:.*:^&:; s:/$::' | paste -sd'|' -)
         NON_META=$(echo "$CHANGED" | grep -vE "$SKIP_RE" || true)
         if [ -z "$NON_META" ]; then
@@ -45,66 +59,115 @@ runs:
           echo "skip=false" >> "$GITHUB_OUTPUT"
         fi
 
-    - name: Compute next version
+    - name: Compute target version
       id: compute
       if: steps.skip-check.outputs.skip != 'true'
       shell: bash
+      env:
+        VERSION_INPUT: ${{ inputs.version-input }}
       run: |
-        BASE="${BASE_REF:-${GITHUB_BASE_REF:-main}}"
-        MAIN_VERSION=$(git show "origin/${BASE}:package.json" | node -p "JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).version")
-        # Increment patch; preserve pre-release suffix.
-        # Handles: 1.5.68 → 1.5.69, 0.2.0-m1 → 0.2.1-m1, 1.0.0-alpha.1 → 1.0.1-alpha.1, 0.2.0-rc.1+build.5 → 0.2.1-rc.1+build.5.
-        NEXT=$(node -e '
-          const v = process.argv[1].match(/^(\d+)\.(\d+)\.(\d+)(-.+)?$/);
-          if (!v) { console.error("Unparseable version:", process.argv[1]); process.exit(1); }
-          const [, major, minor, patchStr, prerelease = ""] = v;
-          console.log(`${major}.${minor}.${Number(patchStr) + 1}${prerelease}`);
-        ' "$MAIN_VERSION")
-        CURRENT=$(node -p "require('./package.json').version")
-        echo "From $MAIN_VERSION → $NEXT (PR branch: $CURRENT)"
-        echo "previous=$MAIN_VERSION" >> "$GITHUB_OUTPUT"
-        echo "next=$NEXT" >> "$GITHUB_OUTPUT"
+        if [ -n "$VERSION_INPUT" ]; then
+          # Validate semver-ish format. Matches the check in publish-spec
+          # + adapters/publish so the contract is consistent.
+          if ! echo "$VERSION_INPUT" | grep -qE \
+              '^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$'; then
+            echo "::error::Invalid version-input format: $VERSION_INPUT"
+            echo "Expected: e.g. 0.1.0, 0.2.0-rc.1, 1.0.0-alpha.1"
+            exit 1
+          fi
+          TARGET="$VERSION_INPUT"
+          CURRENT=$(node -p "require('./package.json').version")
+          echo "version-input: $TARGET (current: $CURRENT)"
+        else
+          BASE="${BASE_REF:-${GITHUB_BASE_REF:-main}}"
+          MAIN_VERSION=$(git show "origin/${BASE}:package.json" | \
+            node -p "JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).version")
+          # Increment patch; preserve pre-release suffix.
+          # Handles: 1.5.68 -> 1.5.69, 0.2.0-m1 -> 0.2.1-m1,
+          # 1.0.0-alpha.1 -> 1.0.1-alpha.1,
+          # 0.2.0-rc.1+build.5 -> 0.2.1-rc.1+build.5.
+          TARGET=$(node -e '
+            const v = process.argv[1].match(/^(\d+)\.(\d+)\.(\d+)(-.+)?$/);
+            if (!v) {
+              console.error("Unparseable version:", process.argv[1]);
+              process.exit(1);
+            }
+            const [, major, minor, patchStr, prerelease = ""] = v;
+            console.log(`${major}.${minor}.${Number(patchStr) + 1}${prerelease}`);
+          ' "$MAIN_VERSION")
+          CURRENT=$(node -p "require('./package.json').version")
+          echo "Auto-bump: $MAIN_VERSION -> $TARGET (PR branch: $CURRENT)"
+        fi
+        echo "previous=$CURRENT" >> "$GITHUB_OUTPUT"
+        echo "next=$TARGET" >> "$GITHUB_OUTPUT"
 
     - name: Apply bump (commit + push)
       id: apply
-      if: steps.skip-check.outputs.skip != 'true'
+      if: steps.skip-check.outputs.skip != 'true' && inputs.skip-commit != 'true'
       shell: bash
+      env:
+        COMMIT_MSG_OVERRIDE: ${{ inputs.commit-message-override }}
       run: |
         NEXT="${{ steps.compute.outputs.next }}"
+        PREVIOUS="${{ steps.compute.outputs.previous }}"
         CURRENT=$(node -p "require('./package.json').version")
-        if [ "$CURRENT" != "$NEXT" ]; then
-          echo "Bumping $CURRENT → $NEXT"
-          npm version "$NEXT" --no-git-tag-version
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          MSG=$(echo "${{ inputs.commit-message }}" | sed "s/{version}/$NEXT/")
-          git add package.json
-          git commit -m "$MSG"
-          # Race-safe push: a concurrent push (e.g. an admin merging
-          # main into the PR branch via the web UI) can land on the
-          # remote between this action's checkout and push. Plain
-          # `git push` then fails with "Updates were rejected ... fetch
-          # first". Rebase onto origin first; if that conflicts (e.g.
-          # origin also bumped version), reset to origin and let the
-          # re-computed NEXT apply cleanly on the new base.
-          BRANCH="${GITHUB_HEAD_REF:-$(git rev-parse --abbrev-ref HEAD)}"
-          git fetch origin "$BRANCH" --depth=1 2>/dev/null || true
-          if ! git merge-base --is-ancestor HEAD "origin/$BRANCH"; then
-            echo "Remote has new commits; rebasing local bump"
-            if git rebase "origin/$BRANCH" 2>/dev/null; then
-              echo "Rebased cleanly"
-            else
-              echo "Rebase conflicted (likely origin also bumped version); resetting and re-applying"
-              git rebase --abort || true
-              git reset --hard "origin/$BRANCH"
-            fi
-          fi
-          git push --force-with-lease
-          echo "bumped=true" >> "$GITHUB_OUTPUT"
-        else
-          echo "Version already correct ($CURRENT), skipping bump"
+
+        if [ "$CURRENT" = "$NEXT" ]; then
+          echo "Version already at $CURRENT - skipping bump."
           echo "bumped=false" >> "$GITHUB_OUTPUT"
+          echo "skipped=true" >> "$GITHUB_OUTPUT"
+          exit 0
         fi
+
+        echo "Bumping $CURRENT -> $NEXT"
+        # Use node -e instead of `npm version`. npm version refuses
+        # to run on a dirty tree, and pnpm's --no-frozen-lockfile
+        # install path leaves pnpm-lock.yaml dirty. Direct JSON edit
+        # is atomic and works regardless of tree state.
+        node -e "
+          const fs = require('fs');
+          const p = JSON.parse(fs.readFileSync('package.json','utf8'));
+          p.version = process.argv[1];
+          fs.writeFileSync('package.json',
+            JSON.stringify(p, null, 2) + '\n');
+        " "$NEXT"
+
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        if [ -n "$COMMIT_MSG_OVERRIDE" ]; then
+          MSG="$COMMIT_MSG_OVERRIDE"
+        else
+          MSG=$(echo "${{ inputs.commit-message }}" | sed "s/{version}/$NEXT/")
+        fi
+        git add package.json
+        # Also stage pnpm-lock.yaml if the install (or other pre-bump
+        # steps) left it modified. `git diff --quiet` exits 1 when there
+        # are changes, so `|| git add` fires on dirty.
+        git diff --quiet -- pnpm-lock.yaml 2>/dev/null || git add pnpm-lock.yaml
+        git commit -m "$MSG"
+
+        # Race-safe push: a concurrent push (e.g. an admin merging
+        # main into the PR branch via the web UI) can land on the
+        # remote between this action's checkout and push. Plain
+        # `git push` then fails with "Updates were rejected ... fetch
+        # first". Rebase onto origin first; if that conflicts (e.g.
+        # origin also bumped version), reset to origin and let the
+        # re-computed NEXT apply cleanly on the new base.
+        BRANCH="${GITHUB_HEAD_REF:-$(git rev-parse --abbrev-ref HEAD)}"
+        git fetch origin "$BRANCH" --depth=1 2>/dev/null || true
+        if ! git merge-base --is-ancestor HEAD "origin/$BRANCH"; then
+          echo "Remote has new commits; rebasing local bump"
+          if git rebase "origin/$BRANCH" 2>/dev/null; then
+            echo "Rebased cleanly"
+          else
+            echo "Rebase conflicted (likely origin also bumped version); resetting and re-applying"
+            git rebase --abort || true
+            git reset --hard "origin/$BRANCH"
+          fi
+        fi
+        git push --force-with-lease
+        echo "bumped=true" >> "$GITHUB_OUTPUT"
+        echo "skipped=false" >> "$GITHUB_OUTPUT"
 
     - name: Mark as skipped
       if: steps.skip-check.outputs.skip == 'true'
@@ -114,3 +177,4 @@ runs:
         echo "previous=${CURRENT}" >> "$GITHUB_OUTPUT"
         echo "next=${CURRENT}" >> "$GITHUB_OUTPUT"
         echo "bumped=false" >> "$GITHUB_OUTPUT"
+        echo "skipped=true" >> "$GITHUB_OUTPUT"
