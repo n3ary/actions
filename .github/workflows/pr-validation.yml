@@ -135,6 +135,68 @@ jobs:
           echo "Vendored standards up to date with"
           echo "${STANDARDS_REPO}@${STANDARDS_REF} (${LATEST_SHA})."
 
+      - name: Detect downlevel vendor-sync commits in this PR
+        env:
+          VENDOR_DIR: ${{ inputs.vendor-dir }}
+          STANDARDS_REPO: ${{ inputs.standards-repo }}
+        run: |
+          set -e
+          SHORT_REPO="${STANDARDS_REPO#*/}"
+          BASE="${BASE_REF:-${GITHUB_BASE_REF:-main}}"
+          # The job's checkout used fetch-depth: 1, so the base ref
+          # isn't local. Fetch it shallowly so we can diff against it.
+          git fetch --depth=1 origin "$BASE" 2>/dev/null || true
+
+          # Resolve main's current vendor SHA from any sync header in
+          # the vendored dir. If nothing is vendored yet (fresh repo),
+          # there's nothing to compare against and no downlevel check
+          # is meaningful; skip.
+          MAIN_VENDOR_SHA=""
+          for f in "${VENDOR_DIR}"/*.md; do
+            [ -f "$f" ] || continue
+            HEAD=$(head -1 "$f")
+            SHA=$(echo "$HEAD" | grep -oP "${SHORT_REPO}@\K[a-f0-9]+" || true)
+            if [ -n "$SHA" ]; then
+              MAIN_VENDOR_SHA="$SHA"
+              break
+            fi
+          done
+          if [ -z "$MAIN_VENDOR_SHA" ]; then
+            echo "No vendored standards in ${VENDOR_DIR}; skip downlevel check"
+            exit 0
+          fi
+
+          # Inspect this PR's commits (excluding merges) for vendor-sync
+          # subject lines targeting a SHA older than main's. A manual
+          # sync that lands an older SHA would revert the vendored
+          # standards to a prior state and silently break the
+          # drift-check contract for every later PR.
+          DOWNLEVEL=""
+          # Match: "chore(standards): vendor from <repo>@<7-char SHA>"
+          VENDOR_RE="chore\(standards\): vendor from ${STANDARDS_REPO}@"
+          while IFS= read -r subject; do
+            TARGET=$(echo "$subject" | grep -oP "${VENDOR_RE}\K[a-f0-9]+")
+            TARGET="${TARGET:-}"
+            [ -z "$TARGET" ] && continue
+            # Lexicographic compare works for fixed-length hex SHAs.
+            if [ "$TARGET" \< "$MAIN_VENDOR_SHA" ]; then
+              DOWNLEVEL="${DOWNLEVEL} ${TARGET}"
+            fi
+          done < <(git log "origin/${BASE}..HEAD" --no-merges --pretty=%s)
+
+          if [ -n "$DOWNLEVEL" ]; then
+            echo "Downlevel vendor-sync commits in this PR:"
+            for t in $DOWNLEVEL; do
+              echo "  ${t} (origin/${BASE} is at ${MAIN_VENDOR_SHA})"
+            done
+            echo ""
+            echo "These commits would revert vendored standards to an older"
+            echo "state. Either rebase on origin/${BASE} to pick up its newer"
+            echo "sync, or wait for the auto-sync PR from ${STANDARDS_REPO}."
+            exit 1
+          fi
+          echo "No downlevel vendor-sync commits in this PR."
+
   line-length-check:
     name: Line-length check (changed files in PR)
     if: ${{ inputs.enable-line-length-check }}
