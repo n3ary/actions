@@ -161,7 +161,7 @@ runs:
     - name: Publish to GitHub Packages
       if: inputs.skip-publish != 'true'
       env:
-        NODE_AUTH_TOKEN: ${{ inputs.github-token }}
+        NODE_AUTH_TOKEN: ${{ inputs.npm-token }}
         HOME: >-
           ${{ runner.temp }}/publish-adapter-${{ inputs.adapter }}-clean-home
       shell: bash
