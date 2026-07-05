@@ -53,10 +53,15 @@ runs:
       with:
         node-version: ${{ inputs.node-version }}
 
-    - name: Install pnpm
+    - name: Install pnpm (explicit version)
+      if: inputs.pnpm-version != ''
       uses: pnpm/action-setup@v6.0.9
       with:
         version: ${{ inputs.pnpm-version }}
+
+    - name: Install pnpm (auto-detect from packageManager)
+      if: inputs.pnpm-version == ''
+      uses: pnpm/action-setup@v6.0.9
 
     - name: Write GH Packages .npmrc
       if: inputs.skip-auth != 'true'
