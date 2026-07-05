@@ -103,9 +103,17 @@ jobs:
         run: |
           set -e
           SHORT_REPO="${STANDARDS_REPO#*/}"
+          # Resolve the canonical SHA to compare against - explicitly the most
+          # recent commit on the chosen ref that touched any file under
+          # standards/, NOT HEAD of the ref. Using HEAD would create
+          # false-positive drift on every non-standards commit to the
+          # publisher main branch (e.g. a docs/ or .github/ change), even
+          # though no consumer vendored content actually drifted. Mirrors
+          # the SHA source in n3ary/standards/scripts/vendor-standards.mjs
+          # (`lastStandardsSha()`), so labels on both ends always agree.
           LATEST_SHA=$(gh api \
-            "repos/${STANDARDS_REPO}/commits/${STANDARDS_REF}" \
-                         --jq '.sha' | cut -c1-7)
+              "repos/${STANDARDS_REPO}/commits?sha=${STANDARDS_REF}&path=standards&per_page=1" \
+              --jq '.[0].sha' | cut -c1-7)
           DRIFT=0
           shopt -s nullglob
           for f in "${VENDOR_DIR}"/*.md; do
