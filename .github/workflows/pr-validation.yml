@@ -1,0 +1,253 @@
+name: PR Validation (shared base)
+
+# Reusable workflow. Consumers call it from their own
+# `.github/workflows/<name>.yml`:
+#
+#   jobs:
+#     shared:
+#       uses: n3ary/actions/.github/workflows/pr-validation.yml@v1
+#       with:
+#         enable-drift-check: 'true'
+#         enable-line-length-check: 'true'
+#         max-line-length: '80'
+#     # repo-specific jobs
+#
+# When called, the calling job name is prefixed to each job. So the
+# branch-protection context for the ASCII check is
+# `<caller>:ascii-check` (e.g. `shared:ascii-check`).
+
+on:
+  workflow_call:
+    inputs:
+      enable-drift-check:
+        description: 'Run the drift-check job (vendored standards SHA).'
+        required: false
+        type: boolean
+        default: true
+      vendor-dir:
+        description: 'Path where vendored standards live. Used by drift-check.'
+        required: false
+        type: string
+        default: 'docs/standards'
+      standards-repo:
+        description: 'Owner/repo of the standards publisher.'
+        required: false
+        type: string
+        default: 'n3ary/standards'
+      standards-ref:
+        description: 'Ref of the standards repo to compare against.'
+        required: false
+        type: string
+        default: 'main'
+      enable-line-length-check:
+        description: 'Run the line-length-check (changed files in PR).'
+        required: false
+        type: boolean
+        default: true
+      max-line-length:
+        description: 'Max chars per line for line-length-check.'
+        required: false
+        type: string
+        default: '80'
+      line-length-include-globs:
+        description: 'Comma-separated globs (fnmatch) for files to check.'
+        required: false
+        type: string
+        default: >-
+          *.ts,*.tsx,*.js,*.jsx,*.mjs,*.cjs,
+          *.sh,*.bash,*.yaml,*.yml,*.json,*.toml
+      line-length-exclude-globs:
+        description: 'Comma-separated globs to skip.'
+        required: false
+        type: string
+        default: >-
+          **/node_modules/**,**/dist/**,**/build/**,**/coverage/**,
+          *.min.js,*.lock,pnpm-lock.yaml,package-lock.json,yarn.lock,
+          *.md,*.mdx
+      base-ref:
+        description: 'Base ref to diff against. Falls back to PR base SHA.'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  ascii-check:
+    name: ASCII-only check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: ASCII-only check (commits + PR title)
+        uses: n3ary/actions/.github/actions/ascii-commits@v1
+        with:
+          base-ref: ${{ inputs.base-ref }}
+
+  drift-check:
+    name: Standards drift check
+    if: ${{ inputs.enable-drift-check }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+      - name: Standards drift check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VENDOR_DIR: ${{ inputs.vendor-dir }}
+          STANDARDS_REPO: ${{ inputs.standards-repo }}
+          STANDARDS_REF: ${{ inputs.standards-ref }}
+        run: |
+          set -e
+          SHORT_REPO="${STANDARDS_REPO#*/}"
+          LATEST_SHA=$(gh api \
+            "repos/${STANDARDS_REPO}/commits/${STANDARDS_REF}" \
+                         --jq '.sha' | cut -c1-7)
+          DRIFT=0
+          shopt -s nullglob
+          for f in "${VENDOR_DIR}"/*.md; do
+            [ -f "$f" ] || continue
+            HEAD=$(head -1 "$f")
+            echo "$HEAD" | grep -q "synced from ${STANDARDS_REPO}@" || continue
+            VENDORED_SHA=$(echo "$HEAD" | grep -oP "${SHORT_REPO}@\K[a-f0-9]+")
+            if [ "$VENDORED_SHA" != "$LATEST_SHA" ]; then
+              echo "Drift: $f vendored at $VENDORED_SHA, latest is $LATEST_SHA"
+              DRIFT=1
+            fi
+          done
+          if [ "$DRIFT" = "1" ]; then
+            echo ""
+            echo "Drift detected. Wait for the auto-sync PR"
+            echo "from ${STANDARDS_REPO}."
+            exit 1
+          fi
+          echo "Vendored standards up to date with"
+          echo "${STANDARDS_REPO}@${STANDARDS_REF} (${LATEST_SHA})."
+
+  line-length-check:
+    name: Line-length check (changed files in PR)
+    if: ${{ inputs.enable-line-length-check }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Check line lengths in changed files
+        env:
+          MAX_LEN: ${{ inputs.max-line-length }}
+          INCLUDE_GLOBS: ${{ inputs.line-length-include-globs }}
+          EXCLUDE_GLOBS: ${{ inputs.line-length-exclude-globs }}
+          BASE_REF: ${{ inputs.base-ref }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -uo pipefail
+
+          RANGE_BASE=""
+          if [ -n "$PR_BASE_SHA" ] && \
+             git rev-parse "$PR_BASE_SHA" >/dev/null 2>&1; then
+            RANGE_BASE="$PR_BASE_SHA"
+          else
+            BASE="${BASE_REF:-${GITHUB_BASE_REF:-main}}"
+            for candidate in "origin/${BASE}" "${BASE}"; do
+              if git rev-parse "$candidate" >/dev/null 2>&1; then
+                RANGE_BASE="$candidate"
+                break
+              fi
+            done
+          fi
+          if [ -z "$RANGE_BASE" ]; then
+            echo "::warning::Could not resolve PR base; skipping."
+            exit 0
+          fi
+
+          CHANGED=$(git diff --name-only \
+                     "${RANGE_BASE}...HEAD" 2>/dev/null || true)
+          if [ -z "$CHANGED" ]; then
+            echo "No changed files in $RANGE_BASE...HEAD. Skipping."
+            exit 0
+          fi
+
+          # Filter via Python with custom glob matcher (handles ** across /).
+          # fnmatch alone treats ** like single *, missing paths like
+          # `node_modules/foo.ts` when the pattern is `**/node_modules/**`.
+          # Bash single-quoted so the Python passes through unmodified.
+          MATCHED=$(echo "$CHANGED" | python3 -c '
+          import sys, re
+
+          def glob_to_regex(pat):
+              out = "^"
+              i = 0
+              while i < len(pat):
+                  c = pat[i]
+                  if c == "*":
+                      if i + 1 < len(pat) and pat[i+1] == "*":
+                          if i + 2 < len(pat) and pat[i+2] == "/":
+                              out += "(.*/)?"
+                              i += 3
+                          elif i > 0 and pat[i-1] == "/":
+                              out += "(/.*)?"
+                              i += 2
+                          else:
+                              out += ".*"
+                              i += 2
+                      else:
+                          out += "[^/]*"
+                          i += 1
+                  elif c == "?":
+                      out += "[^/]"
+                      i += 1
+                  elif c in ".+(){}[]|^$\\":
+                      out += "\\" + c
+                      i += 1
+                  else:
+                      out += c
+                      i += 1
+              return out + "$"
+
+          def matches(path, pat):
+              return re.match(glob_to_regex(pat), path) is not None
+
+          files = [l.strip() for l in sys.stdin if l.strip()]
+          inc = "'"$INCLUDE_GLOBS"'" .split(",")
+          exc = "'"$EXCLUDE_GLOBS"'" .split(",")
+          out = []
+          for f in files:
+              ok = any(matches(f, g) for g in inc)
+              skip = any(matches(f, g) for g in exc)
+              if ok and not skip:
+                  out.append(f)
+          sys.stdout.write("\n".join(out))
+          ')
+
+          if [ -z "$MATCHED" ]; then
+            echo "No changed files match the line-length include globs."
+            exit 0
+          fi
+
+          echo "Checking line lengths (max $MAX_LEN) in:"
+          echo "$MATCHED" | sed 's/^/  /'
+          echo ""
+
+          BAD=""
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            while IFS=: read -r ln len; do
+              BAD="${BAD}${f}:${ln}: ${len} chars (limit ${MAX_LEN})"$'\n'
+            done < <(awk -v max="$MAX_LEN" \
+                       'length > max { printf "%d:%d\n", NR, length }' "$f")
+          done <<< "$MATCHED"
+
+          if [ -n "$BAD" ]; then
+            echo ""
+            echo "::error title=Lines > ${MAX_LEN}::Line too long"
+            echo ""
+            echo "Offending lines (in files changed by this PR):"
+            printf "%s" "$BAD"
+            echo ""
+            echo "Fix: wrap the line, or break it onto the next line."
+            exit 1
+          fi
+          echo "OK: all changed files are within ${MAX_LEN}-char limit."
