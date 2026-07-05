@@ -17,9 +17,8 @@ inputs:
   auth-token:
     description: >-
       Literal auth token for @n3ary/* on GitHub Packages. Required
-      because composite actions cannot access `secrets.X` in their
-      own expressions; the caller must resolve and pass it. Standard
-      recipe: pass `${{ secrets.NPM_TOKEN }}` from the workflow.
+      because composite actions cannot access secrets in their own
+      expressions; the caller must resolve and pass the secret.
     required: true
   node-version:
     description: 'Node.js version to install.'
