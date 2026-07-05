@@ -1,0 +1,85 @@
+name: Check Standards Drift
+
+# Reusable workflow. Consumers call it as a job from their own
+# `.github/workflows/<name>.yml`:
+#
+#   jobs:
+#     drift-check:
+#       uses: n3ary/actions/.github/workflows/check-standards-drift.yml@v1
+#       with:
+#         vendor-dir: docs/standards   # optional, this is the default
+#
+# All three inputs have sensible defaults; ordinary consumers should
+# be able to call this with zero `with:` arguments.
+
+on:
+  workflow_call:
+    inputs:
+      vendor-dir:
+        description: 'Path (relative to repo root) where vendored standards live.'
+        required: false
+        type: string
+        default: 'docs/standards'
+      standards-repo:
+        description: 'Owner/repo of the standards publisher (compared against the sync header SHA).'
+        required: false
+        type: string
+        default: 'n3ary/standards'
+      standards-ref:
+        description: 'Ref of the standards repo to compare against.'
+        required: false
+        type: string
+        default: 'main'
+
+permissions:
+  contents: read
+
+jobs:
+  drift-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.head_ref || github.ref }}
+          fetch-depth: 1
+
+      - name: Check vendored standards against ${{ inputs.standards-repo }}@${{ inputs.standards-ref }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VENDOR_DIR: ${{ inputs.vendor-dir }}
+          STANDARDS_REPO: ${{ inputs.standards-repo }}
+          STANDARDS_REF: ${{ inputs.standards-ref }}
+        run: |
+          set -e
+          # Sync headers look like `<!-- synced from <owner>/<repo>@<sha> on <date> -->`.
+          # The grep below is the source of truth for *what we vendor*; if the
+          # canonical format ever changes, this regex must change with it.
+          SHORT_REPO="${STANDARDS_REPO#*/}"
+
+          LATEST_SHA=$(gh api "repos/${STANDARDS_REPO}/commits/${STANDARDS_REF}" \
+                         --jq '.sha' | cut -c1-7)
+
+          DRIFT=0
+          shopt -s nullglob
+          for f in "${VENDOR_DIR}"/*.md; do
+            [ -f "$f" ] || continue
+            HEAD=$(head -1 "$f")
+            # Files without a sync header are consumer-owned (e.g. a local rule
+            # that happens to live next to docs/standards/*); skip them silently.
+            echo "$HEAD" | grep -q "synced from ${STANDARDS_REPO}@" || continue
+            VENDORED_SHA=$(echo "$HEAD" | grep -oP "${SHORT_REPO}@\K[a-f0-9]+")
+            if [ "$VENDORED_SHA" != "$LATEST_SHA" ]; then
+              echo "Drift: $f vendored at $VENDORED_SHA, latest is $LATEST_SHA"
+              DRIFT=1
+            fi
+          done
+
+          if [ "$DRIFT" = "1" ]; then
+            echo ""
+            echo "Drift detected."
+            echo "Wait for the auto-sync PR from ${STANDARDS_REPO}, or run the vendor script locally:"
+            echo "  cd <path-to-${STANDARDS_REPO}> && node scripts/vendor-standards.mjs --local /tmp/vendor && cp /tmp/vendor/* ${VENDOR_DIR}/"
+            exit 1
+          fi
+          echo "All vendored standards up to date with ${STANDARDS_REPO}@${STANDARDS_REF} ($LATEST_SHA)."
