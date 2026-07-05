@@ -14,16 +14,11 @@ description: >-
 author: 'n3ary'
 
 inputs:
-  auth-secret:
-    description: >-
-      Secret name holding the GH Packages token. Default: NPM_TOKEN.
-      Ignored when auth-token is set directly.
-    required: false
-    default: 'NPM_TOKEN'
   auth-token:
     description: >-
-      Literal token. If set, takes precedence over auth-secret.
-      Useful for tests or non-secret sources.
+      Literal auth token. If unset, falls back to secrets.NPM_TOKEN
+      (the org-standard GH Packages token name). Useful for tests
+      or non-secret sources.
     required: false
     default: ''
   node-version:
@@ -62,7 +57,7 @@ runs:
       if: inputs.skip-auth != 'true'
       shell: bash
       env:
-        AUTH_TOKEN: ${{ inputs.auth-token || secrets[inputs.auth-secret] }}
+        AUTH_TOKEN: ${{ inputs.auth-token || secrets.NPM_TOKEN }}
       run: |
         mkdir -p "$HOME"
         {
