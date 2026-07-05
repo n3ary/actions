@@ -16,11 +16,11 @@ author: 'n3ary'
 inputs:
   auth-token:
     description: >-
-      Literal auth token. If unset, falls back to secrets.NPM_TOKEN
-      (the org-standard GH Packages token name). Useful for tests
-      or non-secret sources.
-    required: false
-    default: ''
+      Literal auth token for @n3ary/* on GitHub Packages. Required
+      because composite actions cannot access `secrets.X` in their
+      own expressions; the caller must resolve and pass it. Standard
+      recipe: pass `${{ secrets.NPM_TOKEN }}` from the workflow.
+    required: true
   node-version:
     description: 'Node.js version to install.'
     required: false
@@ -57,7 +57,7 @@ runs:
       if: inputs.skip-auth != 'true'
       shell: bash
       env:
-        AUTH_TOKEN: ${{ inputs.auth-token || secrets.NPM_TOKEN }}
+        AUTH_TOKEN: ${{ inputs.auth-token }}
       run: |
         mkdir -p "$HOME"
         {
