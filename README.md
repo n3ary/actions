@@ -7,6 +7,7 @@ Composite GitHub Actions for the [n3ary org](https://github.com/n3ary) (consumer
 | Action | Description |
 |---|---|
 | [version-bump](.github/actions/version-bump) | Bumps `package.json#version` on the PR branch to `main + 1`. Handles pre-release tags. |
+| [ascii-commits](.github/actions/ascii-commits) | Fails the build if any commit message (subject + body) on the PR branch, or the PR title, contains non-ASCII characters. |
 
 ## Consumers
 

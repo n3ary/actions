@@ -1,0 +1,110 @@
+name: 'ASCII-only check (commit messages + PR title)'
+description: 'Fails the build if any commit message (subject + body) on the PR branch, or the PR title, contains non-ASCII characters. Keeps git history, branch names, and PR metadata grep-friendly and shell-safe.'
+author: 'n3ary'
+
+inputs:
+  base-ref:
+    description: 'Base ref (branch name) to compare against. Falls back to the workflow''s `GITHUB_BASE_REF`, then to `main`. Used as `origin/<base-ref>`.'
+    required: false
+    default: ''
+  pr-base-sha:
+    description: 'PR base SHA. Falls back to `github.event.pull_request.base.sha` on `pull_request` events. Preferable to `base-ref` for fork PRs where `origin/<base-ref>` isn''t fetched.'
+    required: false
+    default: ''
+  check-pr-title:
+    description: 'Also fail if the PR title contains non-ASCII characters. Default true.'
+    required: false
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    - name: Check commit messages and PR title for non-ASCII
+      id: check
+      shell: bash
+      env:
+        BASE_REF: ${{ inputs.base-ref }}
+        PR_BASE_SHA: ${{ inputs.pr-base-sha || github.event.pull_request.base.sha || '' }}
+        CHECK_PR_TITLE: ${{ inputs.check-pr-title }}
+        PR_TITLE: ${{ github.event.pull_request.title }}
+        GH_EVENT: ${{ github.event_name }}
+      run: |
+        set -uo pipefail
+
+        # ---- Commit message check ----
+        # Pick the range base. PR base SHA is most specific (works for
+        # same-repo and fork PRs without needing origin/<base> fetched).
+        # Fall back to origin/<base> for pushes or non-PR events.
+        RANGE_BASE=""
+        if [ -n "$PR_BASE_SHA" ] && git rev-parse "$PR_BASE_SHA" >/dev/null 2>&1; then
+          RANGE_BASE="$PR_BASE_SHA"
+        else
+          BASE="${BASE_REF:-${GITHUB_BASE_REF:-main}}"
+          for candidate in "origin/${BASE}" "${BASE}"; do
+            if git rev-parse "$candidate" >/dev/null 2>&1; then
+              RANGE_BASE="$candidate"
+              break
+            fi
+          done
+        fi
+
+        if [ -z "$RANGE_BASE" ]; then
+          echo "::warning::Can't resolve PR base (tried PR base SHA, origin/\$BASE, \$BASE). Skipping commit check."
+        else
+          RANGE="${RANGE_BASE}..HEAD"
+          if ! git rev-parse "$RANGE" >/dev/null 2>&1; then
+            echo "::warning::Range $RANGE not resolvable. The caller's actions/checkout must use fetch-depth: 0."
+          else
+            COUNT=$(git rev-list --count "$RANGE")
+            echo "Checking $COUNT commit(s) in $RANGE for non-ASCII characters..."
+            # %B prints subject + body. Perl matches any byte > 0x7F
+            # (the inverse of ASCII-printable). perl -n is universal
+            # across Linux runners + macOS dev machines (BSD grep
+            # doesn't support -P).
+            BAD=$(git log "$RANGE" --pretty=%B 2>/dev/null \
+              | perl -ne 'print "$.: $_" if /[^\x00-\x7F]/' || true)
+            if [ -n "$BAD" ]; then
+              echo ""
+              echo "::error title=Non-ASCII in commit messages::Non-ASCII characters detected in commit messages (range: $RANGE)"
+              echo ""
+              echo "Offending lines (from \$ git log $RANGE --pretty=%B):"
+              echo "$BAD"
+              echo ""
+              cat <<'EOF'
+        ASCII replacements for the common offenders:
+          U+2014 EM DASH      —  ->  --  (or ': ' in prose)
+          U+2013 EN DASH      –  ->  -
+          U+2192 RIGHT ARROW  ->  ->  ->
+          U+2190 LEFT  ARROW  <-  ->  <-
+          U+2026 ELLIPSIS     …  ->  ...
+          U+2018 LEFT  QUOTE  '  ->  '
+          U+2019 RIGHT QUOTE  '  ->  '
+          U+201C LEFT  DQUOTE "  ->  "
+          U+201D RIGHT DQUOTE "  ->  "
+          U+00A0 NBSP              ->  (regular space)
+          U+200D ZWJ               ->  (delete)
+        EOF
+              exit 1
+            fi
+            echo "OK: commit messages are ASCII-clean."
+          fi
+        fi
+
+        # ---- PR title check ----
+        if [ "$CHECK_PR_TITLE" = "true" ] && [ "$GH_EVENT" = "pull_request" ]; then
+          if [ -z "$PR_TITLE" ]; then
+            echo "::warning::PR_TITLE is empty; skipping PR title check."
+          # `!` negates: perl exits 0 for clean ASCII (no-op for us),
+          # exits 1 for non-ASCII found. `!` flips that to a 0
+          # (truthy) only when non-ASCII is present.
+          elif ! echo "$PR_TITLE" | perl -ne 'exit 1 if /[^\x00-\x7F]/'; then
+            echo ""
+            echo "::error title=Non-ASCII in PR title::Non-ASCII characters in PR title: $PR_TITLE"
+            echo ""
+            echo "Edit the PR title on GitHub to use ASCII characters only."
+            echo "See the ASCII replacement table in the commit-check error above."
+            exit 1
+          else
+            echo "OK: PR title is ASCII-clean."
+          fi
+        fi
