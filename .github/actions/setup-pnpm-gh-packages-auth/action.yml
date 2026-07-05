@@ -24,6 +24,10 @@ inputs:
     description: 'Node.js version to install.'
     required: false
     default: '24'
+  pnpm-version:
+    description: 'pnpm version to install. pnpm/action-setup requires explicit version; we no longer rely on the runner image default.'
+    required: false
+    default: '11'
   install-args:
     description: >-
       Arguments passed to `pnpm install`. Default matches the
@@ -51,6 +55,8 @@ runs:
 
     - name: Install pnpm
       uses: pnpm/action-setup@v6.0.9
+      with:
+        version: ${{ inputs.pnpm-version }}
 
     - name: Write GH Packages .npmrc
       if: inputs.skip-auth != 'true'
