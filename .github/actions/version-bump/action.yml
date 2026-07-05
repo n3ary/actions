@@ -23,6 +23,19 @@ inputs:
     description: 'Explicit target version (e.g. "0.3.4"). When set, skips auto-increment and uses this value. Used by publish flows (publish-spec, adapters/publish) that need a precise target rather than main+1. Ignores bump-skip-paths.'
     required: false
     default: ''
+  package-dir:
+    description: 'Directory containing the package.json to bump. Defaults to repo root. Used by publish flows for monorepo sub-packages (e.g. "packages/spec").'
+    required: false
+    default: ''
+  tag-name:
+    description: >-
+      If set, creates a git tag with this name on the bump commit and
+      pushes it to origin. Supports the {version} placeholder (e.g.
+      'packages/spec/v{version}'). When unset, no tag is created -
+      this is the auto-bump-on-PR default. Used by publish flows that
+      need a tag to trigger a downstream publish job.
+    required: false
+    default: ''
   skip-commit:
     description: 'Skip the commit + push (only compute + write to package.json). Used by callers that want to compose the commit themselves.'
     required: false
@@ -65,7 +78,9 @@ runs:
       shell: bash
       env:
         VERSION_INPUT: ${{ inputs.version-input }}
+        PACKAGE_DIR: ${{ inputs.package-dir }}
       run: |
+        PKG_JSON="${PACKAGE_DIR:-.}/package.json"
         if [ -n "$VERSION_INPUT" ]; then
           # Validate semver-ish format. Matches the check in publish-spec
           # + adapters/publish so the contract is consistent.
@@ -76,11 +91,11 @@ runs:
             exit 1
           fi
           TARGET="$VERSION_INPUT"
-          CURRENT=$(node -p "require('./package.json').version")
-          echo "version-input: $TARGET (current: $CURRENT)"
+          CURRENT=$(node -p "require('./${PKG_JSON}').version")
+          echo "version-input: $TARGET (current: $CURRENT, pkg: $PKG_JSON)"
         else
           BASE="${BASE_REF:-${GITHUB_BASE_REF:-main}}"
-          MAIN_VERSION=$(git show "origin/${BASE}:package.json" | \
+          MAIN_VERSION=$(git show "origin/${BASE}:${PKG_JSON}" | \
             node -p "JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).version")
           # Increment patch; preserve pre-release suffix.
           # Handles: 1.5.68 -> 1.5.69, 0.2.0-m1 -> 0.2.1-m1,
@@ -95,11 +110,12 @@ runs:
             const [, major, minor, patchStr, prerelease = ""] = v;
             console.log(`${major}.${minor}.${Number(patchStr) + 1}${prerelease}`);
           ' "$MAIN_VERSION")
-          CURRENT=$(node -p "require('./package.json').version")
-          echo "Auto-bump: $MAIN_VERSION -> $TARGET (PR branch: $CURRENT)"
+          CURRENT=$(node -p "require('./${PKG_JSON}').version")
+          echo "Auto-bump: $MAIN_VERSION -> $TARGET (PR branch: $CURRENT, pkg: $PKG_JSON)"
         fi
         echo "previous=$CURRENT" >> "$GITHUB_OUTPUT"
         echo "next=$TARGET" >> "$GITHUB_OUTPUT"
+        echo "package_dir=$PKG_JSON" >> "$GITHUB_OUTPUT"
 
     - name: Apply bump (commit + push)
       id: apply
@@ -107,10 +123,13 @@ runs:
       shell: bash
       env:
         COMMIT_MSG_OVERRIDE: ${{ inputs.commit-message-override }}
+        PACKAGE_DIR: ${{ inputs.package-dir }}
+        TAG_NAME: ${{ inputs.tag-name }}
       run: |
         NEXT="${{ steps.compute.outputs.next }}"
         PREVIOUS="${{ steps.compute.outputs.previous }}"
-        CURRENT=$(node -p "require('./package.json').version")
+        PKG_JSON="${PACKAGE_DIR:-.}/package.json"
+        CURRENT=$(node -p "require('./${PKG_JSON}').version")
 
         if [ "$CURRENT" = "$NEXT" ]; then
           echo "Version already at $CURRENT - skipping bump."
@@ -119,16 +138,16 @@ runs:
           exit 0
         fi
 
-        echo "Bumping $CURRENT -> $NEXT"
+        echo "Bumping $CURRENT -> $NEXT in $PKG_JSON"
         # Use node -e instead of `npm version`. npm version refuses
         # to run on a dirty tree, and pnpm's --no-frozen-lockfile
         # install path leaves pnpm-lock.yaml dirty. Direct JSON edit
         # is atomic and works regardless of tree state.
         node -e "
           const fs = require('fs');
-          const p = JSON.parse(fs.readFileSync('package.json','utf8'));
+          const p = JSON.parse(fs.readFileSync('${PKG_JSON}','utf8'));
           p.version = process.argv[1];
-          fs.writeFileSync('package.json',
+          fs.writeFileSync('${PKG_JSON}',
             JSON.stringify(p, null, 2) + '\n');
         " "$NEXT"
 
@@ -139,7 +158,7 @@ runs:
         else
           MSG=$(echo "${{ inputs.commit-message }}" | sed "s/{version}/$NEXT/")
         fi
-        git add package.json
+        git add "$PKG_JSON"
         # Also stage pnpm-lock.yaml if the install (or other pre-bump
         # steps) left it modified. `git diff --quiet` exits 1 when there
         # are changes, so `|| git add` fires on dirty.
@@ -166,14 +185,31 @@ runs:
           fi
         fi
         git push --force-with-lease
+
+        # Optional tag creation + push (publish flows).
+        if [ -n "$TAG_NAME" ]; then
+          TAG=$(echo "$TAG_NAME" | sed "s/{version}/$NEXT/")
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists; skipping."
+          else
+            git tag "$TAG"
+            git push origin "$TAG" --no-verify
+            echo "Tagged + pushed: $TAG"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+        fi
+
         echo "bumped=true" >> "$GITHUB_OUTPUT"
         echo "skipped=false" >> "$GITHUB_OUTPUT"
 
     - name: Mark as skipped
       if: steps.skip-check.outputs.skip == 'true'
       shell: bash
+      env:
+        PACKAGE_DIR: ${{ inputs.package-dir }}
       run: |
-        CURRENT=$(node -p "require('./package.json').version" 2>/dev/null || echo "")
+        PKG_JSON="${PACKAGE_DIR:-.}/package.json"
+        CURRENT=$(node -p "require('./${PKG_JSON}').version" 2>/dev/null || echo "")
         echo "previous=${CURRENT}" >> "$GITHUB_OUTPUT"
         echo "next=${CURRENT}" >> "$GITHUB_OUTPUT"
         echo "bumped=false" >> "$GITHUB_OUTPUT"
