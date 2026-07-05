@@ -1,0 +1,212 @@
+name: 'Publish GTFS adapter'
+description: >-
+  Builds, tests, tags, and publishes a single per-feed GTFS adapter
+  from a monorepo to GitHub Packages. Owners use this composite
+  action from their workflow; the workflow owns change detection +
+  dispatch inputs.
+author: 'n3ary'
+
+inputs:
+  adapter:
+    description: >-
+      Adapter directory name (e.g. `cluj-napoca`). Must contain a
+      `package.json` with the package name + version.
+    required: true
+    type: string
+  version-override:
+    description: >-
+      Force a specific version (semver-ish, e.g. `0.3.0` or
+      `1.0.0-rc.1`). When set, the action bumps
+      `adapters/<adapter>/package.json#version` to this value,
+      commits, tags, then publishes. Leave blank for the normal
+      PR-merge flow where the PR author already bumped the version
+      in the source.
+    required: false
+    type: string
+  skip-publish:
+    description: >-
+      Skip the actual `npm publish` step (still builds, tests,
+      tags). Used for dry-run validation of the publish pipeline
+      against a PR branch without polluting the registry.
+    required: false
+    type: string
+    default: 'false'
+  npm-tag:
+    description: >-
+      NPM dist-tag for the publish (e.g. `latest`, `next`,
+      `beta`). Defaults to `latest`.
+    required: false
+    type: string
+    default: 'latest'
+
+outputs:
+  name:
+    description: 'Adapter package name.'
+  version:
+    description: 'Published version (e.g. `0.3.4`).'
+  tag:
+    description: >-
+      Git tag pushed (e.g.
+      `adapters/cluj-napoca/v0.3.4`).
+  published:
+    description: >-
+      "true" if `npm publish` actually ran + succeeded;
+      "false" if `skip-publish` was set.
+
+runs:
+  using: composite
+
+  steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Setup Node
+      uses: actions/setup-node@v6.4.0
+      with:
+        node-version: 24
+
+    - name: Install pnpm
+      uses: pnpm/action-setup@v6.0.9
+
+    - name: Validate adapter directory
+      shell: bash
+      run: |
+        ADAPTER="${{ inputs.adapter }}"
+        if [ ! -d "adapters/$ADAPTER" ]; then
+          echo "::error::Adapter directory not found: adapters/$ADAPTER"
+          exit 1
+        fi
+        if [ ! -f "adapters/$ADAPTER/package.json" ]; then
+          echo "::error::No package.json in adapters/$ADAPTER"
+          exit 1
+        fi
+
+    - name: Read package metadata
+      id: meta
+      shell: bash
+      run: |
+        cd "adapters/${{ inputs.adapter }}"
+        node -e "
+          const p = require('./package.json');
+          if (!p.name) { console.error('Missing name'); process.exit(1); }
+          console.log('name=' + p.name);
+          console.log('version=' + p.version);
+        " >> "$GITHUB_OUTPUT"
+
+    - name: Install dependencies
+      env:
+        NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        HOME: >-
+          ${{ runner.temp }}/publish-adapter-${{ inputs.adapter }}-clean-home
+      shell: bash
+      run: |
+        # HOME-scoped .npmrc: the workspace's committed .npmrc maps
+        # @n3ary scope to GH Packages but does NOT carry the auth
+        # token. Writing a runner-temp .npmrc with _authToken from
+        # the NPM_TOKEN secret is the standard recipe (pnpm reads
+        # auth from .npmrc, not NODE_AUTH_TOKEN env).
+        #
+        # Same pattern as publish-spec.yml + publish-adapter.yml on
+        # n3ary/gtfs-publisher + n3ary/gtfs-adapters.
+        mkdir -p "$HOME"
+        {
+          echo "@n3ary:registry=https://npm.pkg.github.com"
+          echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}"
+        } > "$HOME/.npmrc"
+        pnpm install --frozen-lockfile --trust-lockfile
+
+    - name: Bump version (workflow_dispatch override path)
+      if: inputs.version-override != ''
+      shell: bash
+      run: |
+        VERSION="${{ inputs.version-override }}"
+        if ! echo "$VERSION" | grep -qE \
+          '^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$'; then
+          echo "::error::Invalid version format: $VERSION"
+          exit 1
+        fi
+        cd "adapters/${{ inputs.adapter }}"
+        CURRENT=$(node -p "require('./package.json').version")
+        if [ "$CURRENT" != "$VERSION" ]; then
+          npm version "$VERSION" --no-git-tag-version
+          cd ../..
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "adapters/${{ inputs.adapter }}/package.json"
+          COMMIT_MSG="chore(release): ${{ steps.meta.outputs.name }}"
+          COMMIT_MSG="${COMMIT_MSG} v${VERSION}"
+          git commit -m "${COMMIT_MSG}"
+          echo "Bumped: $CURRENT -> $VERSION"
+        else
+          echo "Version already at $VERSION; skipping bump."
+        fi
+        echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+    - name: Build adapter package
+      shell: bash
+      run: |
+        pnpm --filter "${{ steps.meta.outputs.name }}" build
+
+    - name: Test adapter package
+      shell: bash
+      run: |
+        # Tests run BEFORE the tag is created so a broken publish
+        # never leaves a stale tag on the repo.
+        pnpm --filter "${{ steps.meta.outputs.name }}" test
+
+    - name: Tag + push
+      id: tag
+      shell: bash
+      run: |
+        VERSION="${{ steps.meta.outputs.version }}"
+        ADAPTER="${{ inputs.adapter }}"
+        TAG="adapters/${ADAPTER}/v${VERSION}"
+        echo "name=${{ steps.meta.outputs.name }}" >> "$GITHUB_OUTPUT"
+        echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+        echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        if git rev-parse "${TAG}" >/dev/null 2>&1; then
+          echo "Tag ${TAG} already exists; skipping."
+        else
+          git tag "${TAG}"
+          git push origin "${TAG}" --no-verify
+          echo "Tagged + pushed: ${TAG}"
+        fi
+
+    - name: Publish to GitHub Packages
+      if: inputs.skip-publish != 'true'
+      env:
+        NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        HOME: >-
+          ${{ runner.temp }}/publish-adapter-${{ inputs.adapter }}-clean-home
+      shell: bash
+      run: |
+        mkdir -p "$HOME"
+        {
+          echo "@n3ary:registry=https://npm.pkg.github.com"
+          echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}"
+        } > "$HOME/.npmrc"
+        cd "adapters/${{ inputs.adapter }}"
+        # --access restricted: every @n3ary adapter is private to
+        # the org's GH Packages namespace today. If a future
+        # adapter wants public access, flip this to `public` in a
+        # per-adapter override. Drop --provenance because npm
+        # refuses SLSA attestation on restricted-visibility
+        # packages; tag + workflow run already give us the
+        # supply-chain trail we need.
+        echo "published=true" >> "$GITHUB_OUTPUT"
+        npm publish --access restricted --tag "${{ inputs.npm-tag }}"
+
+    - name: Publish summary
+      if: always()
+      shell: bash
+      env:
+        PKG: ${{ steps.meta.outputs.name }}
+        VER: ${{ steps.meta.outputs.version }}
+        TAG: ${{ steps.tag.outputs.tag }}
+      run: |
+        echo "::notice title=Published ${PKG}::${PKG}@${VER} (tag: ${TAG})"
