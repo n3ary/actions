@@ -72,15 +72,15 @@ runs:
               echo ""
               cat <<'EOF'
         ASCII replacements for the common offenders:
-          U+2014 EM DASH      —  ->  --  (or ': ' in prose)
-          U+2013 EN DASH      –  ->  -
-          U+2192 RIGHT ARROW  ->  ->  ->
-          U+2190 LEFT  ARROW  <-  ->  <-
-          U+2026 ELLIPSIS     …  ->  ...
-          U+2018 LEFT  QUOTE  '  ->  '
-          U+2019 RIGHT QUOTE  '  ->  '
-          U+201C LEFT  DQUOTE "  ->  "
-          U+201D RIGHT DQUOTE "  ->  "
+          U+2014 EM DASH       ->  -            (or ': ' in prose)
+          U+2013 EN DASH       ->  -
+          U+2192 RIGHT ARROW   ->  ->
+          U+2190 LEFT  ARROW   ->  <-
+          U+2026 ELLIPSIS      ->  ...
+          U+2018 LEFT  QUOTE   ->  '
+          U+2019 RIGHT QUOTE   ->  '
+          U+201C LEFT  DQUOTE  ->  "
+          U+201D RIGHT DQUOTE  ->  "
           U+00A0 NBSP              ->  (regular space)
           U+200D ZWJ               ->  (delete)
         EOF
