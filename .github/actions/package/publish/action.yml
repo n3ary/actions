@@ -1,0 +1,245 @@
+name: 'Publish monorepo package'
+description: >-
+  Builds, tests, tags, and publishes a single sub-package from a
+  pnpm workspace monorepo to GitHub Packages. The caller (workflow)
+  supplies the package directory, tag template, and visibility; the
+  action handles checkout, install, build, test, tag, and publish.
+  Used by `gtfs-publisher` (for `packages/spec`) and `gtfs-adapters`
+  (for `adapters/<name>`) publish workflows.
+author: 'n3ary'
+
+inputs:
+  package-dir:
+    description: >-
+      Directory containing the package.json to publish (e.g.
+      `packages/spec`, `adapters/cluj-napoca`).
+    required: true
+    type: string
+  tag-template:
+    description: >-
+      Git tag template. Supports `{version}` and `{name}`
+      placeholders (e.g. `packages/spec/v{version}` or
+      `adapters/{name}/v{version}`). Leave blank to skip tag
+      creation entirely.
+    required: false
+    type: string
+    default: ''
+  version-override:
+    description: >-
+      Force a specific version (semver-ish, e.g. `0.3.4` or
+      `1.0.0-rc.1`). When set, bumps
+      `<package-dir>/package.json#version` to this value, commits,
+      tags, then publishes. Leave blank for the normal PR-merge
+      flow where the PR author already bumped the version in the
+      source.
+    required: false
+    type: string
+    default: ''
+  access:
+    description: >-
+      npm publish --access flag. `public` for open-source or
+      org-wide consumption; `restricted` for org-private only.
+    required: false
+    type: string
+    default: 'restricted'
+  provenance:
+    description: >-
+      Whether to attach SLSA provenance attestation on publish.
+      Note: npm refuses --provenance on restricted-visibility
+      packages, so set to 'false' when access=restricted.
+    required: false
+    type: string
+    default: 'false'
+  skip-publish:
+    description: >-
+      Skip the actual `npm publish` step (still builds, tests,
+      tags). Used for dry-run validation of the publish pipeline
+      against a PR branch without polluting the registry.
+    required: false
+    type: string
+    default: 'false'
+  npm-tag:
+    description: >-
+      NPM dist-tag for the publish (e.g. `latest`, `next`,
+      `beta`). Defaults to `latest`.
+    required: false
+    type: string
+    default: 'latest'
+  github-token:
+    description: >-
+      GitHub token used for `actions/checkout` (so the tag push
+      can authenticate) and for the npm-publish auth (npm
+      refuses NODE_AUTH_TOKEN). Must be passed by the caller from
+      `secrets.GITHUB_TOKEN` because composite actions cannot
+      reference secrets directly.
+    required: true
+    type: string
+  npm-token:
+    description: >-
+      NPM auth token used to install packages from GH Packages
+      (workspace deps). Must be passed by the caller from
+      `secrets.NPM_TOKEN` because composite actions cannot
+      reference secrets directly.
+    required: true
+    type: string
+
+outputs:
+  name:
+    description: 'Package name (from package.json).'
+  version:
+    description: 'Published version (from package.json or version-override).'
+  tag:
+    description: >-
+      Git tag pushed (after template substitution). Empty when
+      tag-template was not set.
+  published:
+    description: >-
+      "true" if `npm publish` actually ran + succeeded;
+      "false" if `skip-publish` was set or publish failed.
+
+runs:
+  using: composite
+
+  steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+        token: ${{ inputs.github-token }}
+
+    - name: Validate package directory
+      shell: bash
+      run: |
+        DIR="${{ inputs.package-dir }}"
+        if [ ! -d "$DIR" ]; then
+          echo "::error::Package directory not found: $DIR"
+          exit 1
+        fi
+        if [ ! -f "$DIR/package.json" ]; then
+          echo "::error::No package.json in $DIR"
+          exit 1
+        fi
+
+    - name: Read package metadata
+      id: meta
+      shell: bash
+      run: |
+        DIR="${{ inputs.package-dir }}"
+        # Use jq (preinstalled on GH runners) instead of node so the
+        # read doesn't require Node to be set up first.
+        NAME=$(jq -r .name "$DIR/package.json")
+        VERSION=$(jq -r .version "$DIR/package.json")
+        if [ -z "$NAME" ] || [ "$NAME" = "null" ]; then
+          echo "::error::Missing 'name' in $DIR/package.json"
+          exit 1
+        fi
+        if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+          echo "::error::Missing 'version' in $DIR/package.json"
+          exit 1
+        fi
+        echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+        echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+    - name: Setup pnpm with GH Packages auth + install
+      uses: n3ary/actions/.github/actions/setup-pnpm-gh-packages-auth@v14
+      with:
+        auth-token: ${{ inputs.npm-token }}
+
+    - name: Bump version (workflow_dispatch override path)
+      if: inputs.version-override != ''
+      uses: n3ary/actions/.github/actions/version-bump@v20
+      with:
+        version-input: ${{ inputs.version-override }}
+        package-dir: ${{ inputs.package-dir }}
+        tag-name: ${{ inputs.tag-template }}
+        commit-message-override: >-
+          chore(release): ${{ steps.meta.outputs.name }} v{version}
+
+    - name: Build package
+      shell: bash
+      run: |
+        # pnpm --filter respects workspace deps so a single-package
+        # build doesn't break consumers that depend on this package.
+        pnpm --filter "${{ steps.meta.outputs.name }}" build
+
+    - name: Test package
+      shell: bash
+      # Tests run BEFORE the tag is created so a broken publish
+      # never leaves a stale tag on the repo.
+      run: |
+        pnpm --filter "${{ steps.meta.outputs.name }}" test
+
+    - name: Tag + push
+      id: tag
+      if: inputs.tag-template != ''
+      shell: bash
+      run: |
+        VERSION="${{ steps.meta.outputs.version }}"
+        NAME="${{ steps.meta.outputs.name }}"
+        # Substitute both placeholders: {version} -> the new version,
+        # {name} -> the unscoped package name (everything after @).
+        SHORT_NAME=$(echo "$NAME" | sed 's/^@[^/]*\///')
+        TAG=$(echo "${{ inputs.tag-template }}" \
+              | sed "s/{version}/$VERSION/g" \
+              | sed "s/{name}/$SHORT_NAME/g")
+        echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+        echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+        echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        if git rev-parse "${TAG}" >/dev/null 2>&1; then
+          echo "Tag ${TAG} already exists; skipping."
+        else
+          git tag "${TAG}"
+          git push origin "${TAG}" --no-verify
+          echo "Tagged + pushed: ${TAG}"
+        fi
+
+    - name: Publish to GitHub Packages
+      if: inputs.skip-publish != 'true'
+      env:
+        NODE_AUTH_TOKEN: ${{ inputs.github-token }}
+        HOME: >-
+          ${{ runner.temp }}/publish-package-
+          ${{ steps.meta.outputs.name }}-clean-home
+        ACCESS: ${{ inputs.access }}
+        PROVENANCE: ${{ inputs.provenance }}
+        NPM_TAG: ${{ inputs.npm-tag }}
+      shell: bash
+      run: |
+        mkdir -p "$HOME"
+        # npm reads auth from ~/.npmrc, not from NODE_AUTH_TOKEN env
+        # var, by default. Write a HOME-scoped .npmrc that maps
+        # the @n3ary scope to GitHub Packages and supplies the token
+        # inline. Scoped to the run temp dir so it doesn't leak
+        # into the global ~/.npmrc on the runner.
+        #
+        # Note: heredoc is unquoted (no 'EOF') so ${NODE_AUTH_TOKEN}
+        # gets expanded by the shell. Quoted heredocs ('EOF') would
+        # leave the literal string in the file and npm would reject
+        # the auth.
+        {
+          echo "@n3ary:registry=https://npm.pkg.github.com"
+          echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}"
+        } > "$HOME/.npmrc"
+        cd "${{ inputs.package-dir }}"
+        # Build the npm publish command. --provenance is skipped on
+        # restricted packages because npm refuses SLSA attestation
+        # on restricted-visibility packages; the tag + workflow run
+        # already give us the supply-chain trail we need.
+        ARGS=(--access "$ACCESS" --tag "$NPM_TAG")
+        if [ "$PROVENANCE" = "true" ] && [ "$ACCESS" = "public" ]; then
+          ARGS+=(--provenance)
+        fi
+        echo "published=true" >> "$GITHUB_OUTPUT"
+        npm publish "${ARGS[@]}"
+
+    - name: Publish summary
+      if: always()
+      env:
+        PKG: ${{ steps.meta.outputs.name }}
+        VER: ${{ steps.meta.outputs.version }}
+        TAG: ${{ steps.tag.outputs.tag }}
+      shell: bash
+      run: |
+        echo "::notice title=Published ${PKG}::${PKG}@${VER} (tag: ${TAG})"
