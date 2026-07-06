@@ -13,7 +13,7 @@ Composite GitHub Actions and reusable workflows for the [n3ary org](https://gith
 | Workflow | Description |
 |---|---|
 | [check-standards-drift](.github/workflows/check-standards-drift.yml) | Fails the consuming PR if any vendored standard under `docs/standards/` is older than the current `n3ary/standards@main`. Replaces the per-consumer copy of `check-standards-drift.yml`. |
-| [pr-validation](.github/workflows/pr-validation.yml) | Shared base PR-validation: `ascii-check` + optional `drift-check` + optional `line-length-check`. Call this instead of writing your own `pr-validation.yml`. |
+| [pr-validation](.github/workflows/pr-validation.yml) | Shared base PR-validation: `ascii-check` + optional `drift-check`. Call this instead of writing your own `pr-validation.yml`. |
 
 ### `check-standards-drift` inputs
 
@@ -46,10 +46,6 @@ jobs:
 | `vendor-dir` | no | `docs/standards` | Path where vendored standards live. |
 | `standards-repo` | no | `n3ary/standards` | Owner/repo of the standards publisher. |
 | `standards-ref` | no | `main` | Ref of the standards repo. |
-| `enable-line-length-check` | no | `true` | Run the line-length check on changed files. |
-| `max-line-length` | no | `80` | Max chars per line. |
-| `line-length-include-globs` | no | (see workflow) | Comma-separated fnmatch globs to check. |
-| `line-length-exclude-globs` | no | (see workflow) | Comma-separated fnmatch globs to skip. |
 | `base-ref` | no | (auto) | Base ref to diff against. Falls back to PR base SHA. |
 
 Example consumer workflow:
@@ -75,8 +71,7 @@ jobs:
 
 Note: when called as `jobs.shared`, the called workflow's jobs
 are prefixed with `shared:`. So the branch-protection context
-names become `shared:ascii-check`, `shared:drift-check`,
-`shared:line-length-check`.
+names become `shared:ascii-check`, `shared:drift-check`.
 
 ## Consumers
 
