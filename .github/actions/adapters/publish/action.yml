@@ -1,9 +1,13 @@
-name: 'Publish GTFS adapter'
+name: 'Publish GTFS adapter (DEPRECATED, use package/publish)'
 description: >-
-  Builds, tests, tags, and publishes a single per-feed GTFS adapter
-  from a monorepo to GitHub Packages. Owners use this composite
-  action from their workflow; the workflow owns change detection +
-  dispatch inputs.
+  **DEPRECATED**: replaced by `package/publish` (see
+  `.github/actions/package/publish/`). The new action is a
+  generalization that takes a `package-dir` instead of a hardcoded
+  `adapters/<name>` path, and works for any pnpm workspace
+  sub-package. Migrate by switching the `uses:` ref and remapping
+  `adapter` -> `package-dir` + `tag-template` (see package/publish
+  README for the exact mapping). This action stays at v17 (last
+  tagged version) for archival; no new tags will be cut.
 author: 'n3ary'
 
 inputs:
