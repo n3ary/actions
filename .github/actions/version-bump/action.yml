@@ -40,16 +40,6 @@ inputs:
     description: 'Skip the commit + push (only compute + write to package.json). Used by callers that want to compose the commit themselves.'
     required: false
     default: 'false'
-  push-target-branch:
-    description: >-
-      Branch to push the bump commit to. When set, the action creates
-      this branch from origin/<base> if it does not yet exist, checks
-      it out, applies the bump, and pushes it (instead of pushing back
-      to the current branch). Supports the {version} placeholder (e.g.
-      'release/spec-v{version}'). Required for publish flows on repos
-      with branch protection that block direct pushes to main.
-    required: false
-    default: ''
 
 outputs:
   previous-version:
@@ -60,15 +50,6 @@ outputs:
     description: '"true" if the version was bumped; "false" if skipped (metadata-only diff, already correct, or version-input matched current).'
   skipped:
     description: '"true" if the action skipped (metadata-only diff OR version-input matched current).'
-  pushed-branch:
-    description: >-
-      The branch the bump commit was pushed to. When push-target-branch
-      is set, this is the resolved target branch name; otherwise it is
-      the original branch.
-  tag:
-    description: >-
-      The git tag that was created (after {version} substitution).
-      Empty when tag-name was not set or the tag already existed.
 
 runs:
   using: composite
@@ -144,12 +125,10 @@ runs:
         COMMIT_MSG_OVERRIDE: ${{ inputs.commit-message-override }}
         PACKAGE_DIR: ${{ inputs.package-dir }}
         TAG_NAME: ${{ inputs.tag-name }}
-        PUSH_TARGET_BRANCH: ${{ inputs.push-target-branch }}
       run: |
         NEXT="${{ steps.compute.outputs.next }}"
         PREVIOUS="${{ steps.compute.outputs.previous }}"
         PKG_JSON="${PACKAGE_DIR:-.}/package.json"
-        BASE="${BASE_REF:-${GITHUB_BASE_REF:-main}}"
         CURRENT=$(node -p "require('./${PKG_JSON}').version")
 
         if [ "$CURRENT" = "$NEXT" ]; then
@@ -174,11 +153,8 @@ runs:
 
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
-        # Resolve commit message. Both paths substitute {version}
-        # with the bumped version so callers can use a single
-        # template for either the default or override message.
         if [ -n "$COMMIT_MSG_OVERRIDE" ]; then
-          MSG=$(echo "$COMMIT_MSG_OVERRIDE" | sed "s/{version}/$NEXT/")
+          MSG="$COMMIT_MSG_OVERRIDE"
         else
           MSG=$(echo "${{ inputs.commit-message }}" | sed "s/{version}/$NEXT/")
         fi
@@ -189,51 +165,28 @@ runs:
         git diff --quiet -- pnpm-lock.yaml 2>/dev/null || git add pnpm-lock.yaml
         git commit -m "$MSG"
 
-        # Branch resolution.
-        # - push-target-branch: publish flows that must land on a
-        #   release branch (branch protection blocks direct pushes to
-        #   main). The target branch is created from origin/<base> if
-        #   it does not yet exist. Supports {version} placeholder.
-        # - Otherwise (PR auto-bump): push back to the PR branch.
-        if [ -n "$PUSH_TARGET_BRANCH" ]; then
-          TARGET_BRANCH=$(echo "$PUSH_TARGET_BRANCH" | sed "s/{version}/$NEXT/")
-          echo "Push target branch: $TARGET_BRANCH"
-          git fetch origin "$BASE" --depth=1
-          if git rev-parse "origin/$TARGET_BRANCH" >/dev/null 2>&1; then
-            # Existing release branch: reset to base and re-apply
-            # on top, so the bump commit is the only diff vs main.
-            git checkout -B "$TARGET_BRANCH" "origin/$BASE"
+        # Race-safe push: a concurrent push (e.g. an admin merging
+        # main into the PR branch via the web UI) can land on the
+        # remote between this action's checkout and push. Plain
+        # `git push` then fails with "Updates were rejected ... fetch
+        # first". Rebase onto origin first; if that conflicts (e.g.
+        # origin also bumped version), reset to origin and let the
+        # re-computed NEXT apply cleanly on the new base.
+        BRANCH="${GITHUB_HEAD_REF:-$(git rev-parse --abbrev-ref HEAD)}"
+        git fetch origin "$BRANCH" --depth=1 2>/dev/null || true
+        if ! git merge-base --is-ancestor HEAD "origin/$BRANCH"; then
+          echo "Remote has new commits; rebasing local bump"
+          if git rebase "origin/$BRANCH" 2>/dev/null; then
+            echo "Rebased cleanly"
           else
-            # New release branch from base.
-            git checkout -b "$TARGET_BRANCH" "origin/$BASE"
+            echo "Rebase conflicted (likely origin also bumped version); resetting and re-applying"
+            git rebase --abort || true
+            git reset --hard "origin/$BRANCH"
           fi
-          git push --force-with-lease origin "$TARGET_BRANCH"
-          echo "pushed-branch=$TARGET_BRANCH" >> "$GITHUB_OUTPUT"
-        else
-          # Race-safe push: a concurrent push (e.g. an admin merging
-          # main into the PR branch via the web UI) can land on the
-          # remote between this action's checkout and push. Plain
-          # `git push` then fails with "Updates were rejected ... fetch
-          # first". Rebase onto origin first; if that conflicts (e.g.
-          # origin also bumped version), reset to origin and let the
-          # re-computed NEXT apply cleanly on the new base.
-          BRANCH="${GITHUB_HEAD_REF:-$(git rev-parse --abbrev-ref HEAD)}"
-          git fetch origin "$BRANCH" --depth=1 2>/dev/null || true
-          if ! git merge-base --is-ancestor HEAD "origin/$BRANCH"; then
-            echo "Remote has new commits; rebasing local bump"
-            if git rebase "origin/$BRANCH" 2>/dev/null; then
-              echo "Rebased cleanly"
-            else
-              echo "Rebase conflicted (likely origin also bumped version); resetting and re-applying"
-              git rebase --abort || true
-              git reset --hard "origin/$BRANCH"
-            fi
-          fi
-          git push --force-with-lease
         fi
+        git push --force-with-lease
 
-        # Optional tag creation + push (publish flows). Tag is pushed
-        # directly since tags do not flow through branch protection.
+        # Optional tag creation + push (publish flows).
         if [ -n "$TAG_NAME" ]; then
           TAG=$(echo "$TAG_NAME" | sed "s/{version}/$NEXT/")
           if git rev-parse "$TAG" >/dev/null 2>&1; then
