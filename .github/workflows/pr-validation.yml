@@ -55,7 +55,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: ASCII-only check (commits + PR title)
-        uses: n3ary/actions/.github/actions/ascii-commits@v1
+        uses: n3ary/actions/.github/actions/ascii-commits@v22
         with:
           base-ref: ${{ inputs.base-ref }}
 
