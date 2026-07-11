@@ -1,7 +1,7 @@
 # n3ary/actions
 Composite GitHub Actions and reusable workflows for the [n3ary org](https://github.com/n3ary) (consumer + producers).
 
-## Actions (composite)
+## Reusable workflows
 
 | Action | Description |
 |---|---|
@@ -13,7 +13,8 @@ Composite GitHub Actions and reusable workflows for the [n3ary org](https://gith
 | Workflow | Description |
 |---|---|
 | [check-standards-drift](.github/workflows/check-standards-drift.yml) | Fails the consuming PR if any vendored standard under `docs/standards/` is older than the current `n3ary/standards@main`. Replaces the per-consumer copy of `check-standards-drift.yml`. |
-| [pr-validation](.github/workflows/pr-validation.yml) | Shared base PR-validation: `ascii-check` + optional `drift-check`. Call this instead of writing your own `pr-validation.yml`. |
+| [pr-check](.github/workflows/pr-check.yml) | Standard "PR check" wrapper: the consumer-facing entry point. Calls `pr-validation` with the standard input contract. Consumers should use this, not `pr-validation` directly. |
+| [pr-validation](.github/workflows/pr-validation.yml) | Shared base PR-validation: `ascii-check` + optional `drift-check`. Implementation behind `pr-check`. |
 
 ### `check-standards-drift` inputs
 
@@ -38,7 +39,14 @@ jobs:
     uses: n3ary/actions/.github/workflows/check-standards-drift.yml@v1
 ```
 
-### `pr-validation` inputs
+### `pr-check` vs `pr-validation`
+
+- **`pr-check.yml`** is the consumer-facing entry point. It accepts the same inputs as `pr-validation` (`enable-drift-check`, `vendor-dir`, `standards-repo`, `standards-ref`, `base-ref`) and forwards them. Consumers should call this.
+- **`pr-validation.yml`** is the actual implementation. It runs the `ascii-check` and `drift-check` jobs. Most consumers should never call this directly; only `pr-check` does.
+
+The split exists so a single change to the standard PR-check contract (e.g. adding a new shared step) lands in one place instead of in every consumer's local file.
+
+### `pr-check` inputs
 
 | Input | Required | Default | Description |
 | --- | --- | --- | --- |
@@ -51,16 +59,18 @@ jobs:
 Example consumer workflow:
 
 ```yaml
-# <consumer>/.github/workflows/pr-validation.yml
-name: PR Validation
+# <consumer>/.github/workflows/pr-check.yml
+name: '[check] PR validation (on PR)'
 on:
   pull_request:
     branches: [main]
 permissions:
   contents: read
 jobs:
-  shared:
-    uses: n3ary/actions/.github/workflows/pr-validation.yml@v1
+  pr-check:
+    uses: n3ary/actions/.github/workflows/pr-check.yml@v23
+    with:
+      enable-drift-check: 'true'   # or false if you don't vendor standards
   # repo-specific jobs (e.g. test matrix)
   validate:
     runs-on: ubuntu-latest
@@ -69,9 +79,9 @@ jobs:
       - run: npm test
 ```
 
-Note: when called as `jobs.shared`, the called workflow's jobs
-are prefixed with `shared:`. So the branch-protection context
-names become `shared:ascii-check`, `shared:drift-check`.
+Note: when called as `jobs.pr-check`, the called workflow's jobs
+are prefixed with `pr-check:`. So the branch-protection context
+names become `pr-check:ascii-check`, `pr-check:drift-check`.
 
 ## Consumers
 

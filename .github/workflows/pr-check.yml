@@ -1,0 +1,75 @@
+name: PR Check (shared wrapper)
+
+# Reusable workflow. Consumers call this from their own
+# `.github/workflows/pr-check.yml` instead of calling
+# `pr-validation.yml` directly:
+#
+#   jobs:
+#     pr-check:
+#       uses: n3ary/actions/.github/workflows/pr-check.yml@v23
+#       with:
+#         enable-drift-check: 'true'   # or false
+#     # repo-specific jobs
+#
+# Why this exists as a separate reusable (vs. calling pr-validation
+# directly):
+#   - Single point of contact for the standard PR validation contract.
+#     If we add a new check, fix a default, or change how the shared
+#     workflow is called, consumers don't have to update their local
+#     file.
+#   - The naming pattern `[check] PR validation (on PR)` + the
+#     ascii + drift checks are the same for every n3ary repo. Keeping
+#     that in one place enforces consistency.
+#
+# Difference from `pr-validation.yml` (which this calls): none, today.
+# `pr-validation.yml` is the actual implementation (ascii-check +
+# drift-check jobs); this is the "call it with the standard inputs"
+# wrapper. If we ever need a shared pre-step (e.g. checkout with
+# fetch-depth: 0 for all consumers), it goes here, not in every
+# consumer's local file.
+
+on:
+  workflow_call:
+    inputs:
+      enable-drift-check:
+        description: 'Run the drift-check job (vendored standards SHA).'
+        required: false
+        type: boolean
+        default: true
+      vendor-dir:
+        description: 'Path where vendored standards live. Used by drift-check.'
+        required: false
+        type: string
+        default: 'docs/standards'
+      standards-repo:
+        description: 'Owner/repo of the standards publisher.'
+        required: false
+        type: string
+        default: 'n3ary/standards'
+      standards-ref:
+        description: 'Ref of the standards repo.'
+        required: false
+        type: string
+        default: 'main'
+      base-ref:
+        description: 'Base ref to diff against. Falls back to PR base SHA.'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  pr-validation:
+    # Use a relative path so consumers always get the pr-validation
+    # version pinned by the same tag they pinned pr-check to. If we
+    # hardcoded @v22 here, this wrapper would silently fall behind
+    # when pr-validation bumps to v23.
+    uses: ./pr-validation.yml
+    with:
+      enable-drift-check: ${{ inputs.enable-drift-check }}
+      vendor-dir: ${{ inputs.vendor-dir }}
+      standards-repo: ${{ inputs.standards-repo }}
+      standards-ref: ${{ inputs.standards-ref }}
+      base-ref: ${{ inputs.base-ref }}
