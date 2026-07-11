@@ -1,8 +1,8 @@
-name: '[check] PR check (callable)'
-
+# ----------------------------------------------------------------------------
+# PR Check (canonical, self-contained)
+#
 # Reusable workflow. Consumers call this from their own
-# `.github/workflows/pr-check.yml` instead of calling
-# `pr-validation.yml` directly:
+# `.github/workflows/pr-check.yml`:
 #
 #   jobs:
 #     pr-check:
@@ -11,22 +11,32 @@ name: '[check] PR check (callable)'
 #         enable-drift-check: 'true'   # or false
 #     # repo-specific jobs
 #
-# Why this exists as a separate reusable (vs. calling pr-validation
-# directly):
-#   - Single point of contact for the standard PR validation contract.
-#     If we add a new check, fix a default, or change how the shared
-#     workflow is called, consumers don't have to update their local
-#     file.
-#   - The naming pattern `[check] PR validation (on PR)` + the
-#     ascii + drift checks are the same for every n3ary repo. Keeping
-#     that in one place enforces consistency.
+# This is the canonical "standard PR check" for the n3ary org.
+# Branch protection in consumer repos requires the check names
+# produced by THIS file's jobs:
+#   - pr-check:ascii-check
+#   - pr-check:Standards drift check
+#   - (when enable-drift-check: 'false', the drift-check job is
+#     skipped - the check simply doesn't appear in branch protection)
 #
-# Difference from `pr-validation.yml` (which this calls): none, today.
-# `pr-validation.yml` is the actual implementation (ascii-check +
-# drift-check jobs); this is the "call it with the standard inputs"
-# wrapper. If we ever need a shared pre-step (e.g. checkout with
-# fetch-depth: 0 for all consumers), it goes here, not in every
-# consumer's local file.
+# Why self-contained (not a passthrough to a separate reusable):
+#   - The check names stay clean (`pr-check:ascii-check` not
+#     `pr-check:pr-validation:ascii-check`).
+#   - Single source of truth. If we add a new check, fix a default,
+#     or change how the shared workflow is called, we update this
+#     file - consumers don't have to.
+#   - The `n3ary/actions/.github/actions/ascii-commits` composite
+#     is still used for the actual check; the per-org config
+#     (vendor-dir, standards-repo, ...) is the only thing this
+#     file adds over a direct call to ascii-commits.
+#
+# Why we kept pr-validation.yml too:
+#   - Backward compatibility for any consumer that still calls it
+#     directly. The two files have identical job structure; this
+#     one is the source of truth, pr-validation.yml is an alias.
+#   - Will be removed in a future major version bump.
+# ----------------------------------------------------------------------------
+name: '[check] PR check (callable)'
 
 on:
   workflow_call:
@@ -61,15 +71,127 @@ permissions:
   contents: read
 
 jobs:
-  pr-validation:
-    # Use a relative path so consumers always get the pr-validation
-    # version pinned by the same tag they pinned pr-check to. If we
-    # hardcoded @v22 here, this wrapper would silently fall behind
-    # when pr-validation bumps to v23.
-    uses: ./pr-validation.yml
-    with:
-      enable-drift-check: ${{ inputs.enable-drift-check }}
-      vendor-dir: ${{ inputs.vendor-dir }}
-      standards-repo: ${{ inputs.standards-repo }}
-      standards-ref: ${{ inputs.standards-ref }}
-      base-ref: ${{ inputs.base-ref }}
+  ascii-check:
+    name: ASCII-only check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: ASCII-only check (commits + PR title)
+        uses: n3ary/actions/.github/actions/ascii-commits@v22
+        with:
+          base-ref: ${{ inputs.base-ref }}
+
+  drift-check:
+    name: Standards drift check
+    if: ${{ inputs.enable-drift-check }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+      - name: Standards drift check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VENDOR_DIR: ${{ inputs.vendor-dir }}
+          STANDARDS_REPO: ${{ inputs.standards-repo }}
+          STANDARDS_REF: ${{ inputs.standards-ref }}
+        run: |
+          set -e
+          SHORT_REPO="${STANDARDS_REPO#*/}"
+          # Resolve the canonical SHA to compare against - explicitly the most
+          # recent commit on the chosen ref that touched any file under
+          # standards/, NOT HEAD of the ref. Using HEAD would create
+          # false-positive drift on every non-standards commit to the
+          # publisher main branch (e.g. a docs/ or .github/ change), even
+          # though no consumer vendored content actually drifted. Mirrors
+          # the SHA source in n3ary/standards/scripts/vendor-standards.mjs
+          # (`lastStandardsSha()`), so labels on both ends always agree.
+          LATEST_SHA=$(gh api \
+              "repos/${STANDARDS_REPO}/commits?sha=${STANDARDS_REF}&path=standards&per_page=1" \
+              --jq '.[0].sha' | cut -c1-7)
+          DRIFT=0
+          shopt -s nullglob
+          for f in "${VENDOR_DIR}"/*.md; do
+            [ -f "$f" ] || continue
+            HEAD=$(head -1 "$f")
+            echo "$HEAD" | grep -q "synced from ${STANDARDS_REPO}@" || continue
+            VENDORED_SHA=$(echo "$HEAD" | grep -oP "${SHORT_REPO}@\K[a-f0-9]+")
+            if [ "$VENDORED_SHA" != "$LATEST_SHA" ]; then
+              echo "Drift: $f vendored at $VENDORED_SHA, latest is $LATEST_SHA"
+              DRIFT=1
+            fi
+          done
+          if [ "$DRIFT" = "1" ]; then
+            echo ""
+            echo "Drift detected. Wait for the auto-sync PR"
+            echo "from ${STANDARDS_REPO}."
+            exit 1
+          fi
+          echo "Vendored standards up to date with"
+          echo "${STANDARDS_REPO}@${STANDARDS_REF} (${LATEST_SHA})."
+
+      - name: Detect downlevel vendor-sync commits in this PR
+        env:
+          VENDOR_DIR: ${{ inputs.vendor-dir }}
+          STANDARDS_REPO: ${{ inputs.standards-repo }}
+        run: |
+          set -e
+          SHORT_REPO="${STANDARDS_REPO#*/}"
+          BASE="${BASE_REF:-${GITHUB_BASE_REF:-main}}"
+          # The job's checkout used fetch-depth: 1, so the base ref
+          # isn't local. Fetch it shallowly so we can diff against it.
+          git fetch --depth=1 origin "$BASE" 2>/dev/null || true
+
+          # Resolve main's current vendor SHA from any sync header in
+          # the vendored dir. If nothing is vendored yet (fresh repo),
+          # there's nothing to compare against and no downlevel check
+          # is meaningful; skip.
+          MAIN_VENDOR_SHA=""
+          for f in "${VENDOR_DIR}"/*.md; do
+            [ -f "$f" ] || continue
+            HEAD=$(head -1 "$f")
+            SHA=$(echo "$HEAD" | grep -oP "${SHORT_REPO}@\K[a-f0-9]+" || true)
+            if [ -n "$SHA" ]; then
+              MAIN_VENDOR_SHA="$SHA"
+              break
+            fi
+          done
+          if [ -z "$MAIN_VENDOR_SHA" ]; then
+            echo "No vendored standards in ${VENDOR_DIR}; skip downlevel check"
+            exit 0
+          fi
+
+          # Inspect this PR's commits (excluding merges) for vendor-sync
+          # subject lines targeting a SHA older than main's. A manual
+          # sync that lands an older SHA would revert the vendored
+          # standards to a prior state and silently break the
+          # drift-check contract for every later PR.
+          DOWNLEVEL=""
+          # Match: "chore(standards): vendor from <repo>@<7-char SHA>"
+          VENDOR_RE="chore\(standards\): vendor from ${STANDARDS_REPO}@"
+          while IFS= read -r subject; do
+            # grep -oP exits 1 when the pattern doesn't match (the
+            # common case for non-vendor commits), and `set -e` would
+            # otherwise abort the script. `|| true` swallows that.
+            T=$(echo "$subject" | grep -oP "${VENDOR_RE}\K[a-f0-9]+" || true)
+            [ -z "$T" ] && continue
+            # Lexicographic compare works for fixed-length hex SHAs.
+            if [ "$T" \< "$MAIN_VENDOR_SHA" ]; then
+              DOWNLEVEL="${DOWNLEVEL} ${T}"
+            fi
+          done < <(git log "origin/${BASE}..HEAD" --no-merges --pretty=%s)
+
+          if [ -n "$DOWNLEVEL" ]; then
+            echo "Downlevel vendor-sync commits in this PR:"
+            for t in $DOWNLEVEL; do
+              echo "  ${t} (origin/${BASE} is at ${MAIN_VENDOR_SHA})"
+            done
+            echo ""
+            echo "These commits would revert vendored standards to an older"
+            echo "state. Either rebase on origin/${BASE} to pick up its newer"
+            echo "sync, or wait for the auto-sync PR from ${STANDARDS_REPO}."
+            exit 1
+          fi
+          echo "No downlevel vendor-sync commits in this PR."
