@@ -73,6 +73,61 @@ Note: when called as `jobs.shared`, the called workflow's jobs
 are prefixed with `shared:`. So the branch-protection context
 names become `shared:ascii-check`, `shared:drift-check`.
 
+## Setting secrets (human tool)
+
+`scripts/set-secret.py` is the safe way to set a GH Actions secret
+from your local machine. The default `gh secret set` mangles
+PEM-shaped values (SSH keys, JWT tokens, anything with `=` or
+`-` characters) because it pre-parses the value as dotenv. This
+script uses the raw GH REST API with libsodium sealed-box
+encryption, which is exactly what `gh` does internally but without
+the dotenv preprocessor.
+
+Background: this bug bit us in `n3ary/gtfs-publisher` on
+`HETZNER_SSH_KEY` (2026-07-10). The key file was valid locally
+(`ssh-keygen -l` was happy) but `error in libcrypto` after going
+through `gh secret set`. The same bug probably silently corrupted
+PEM/JWT-shaped secrets across the org - audit before re-setting.
+
+```sh
+# from a file
+python3 scripts/set-secret.py n3ary/gtfs-publisher HETZNER_SSH_KEY ~/.ssh/deploy_key
+
+# from stdin (the recommended path - pipe, don't quote)
+cat deploy_key | python3 scripts/set-secret.py n3ary/gtfs-publisher HETZNER_SSH_KEY -
+
+# dry-run (encrypt + print, don't set)
+python3 scripts/set-secret.py n3ary/gtfs-publisher HETZNER_SSH_KEY ~/.ssh/deploy_key --dry-run
+
+# delete
+python3 scripts/set-secret.py n3ary/gtfs-publisher OLD_SECRET --delete
+```
+
+The script auto-installs `pynacl` into `~/.local/share/gh-set-secret-venv/`
+on first run. It uses the `gh auth token` for the GH API call,
+so make sure you've run `gh auth login` against the org/user that
+owns the target repo.
+
+## PR-merge convention: never `--auto`
+
+`gh pr merge --auto` waits for the *required* status checks and
+fires the merge when they pass. The check named `auto-bump` (the
+`n3ary/actions/.github/actions/version-bump` job that pushes a
+`chore(release): auto-bump` commit on every PR) is **not** in
+the required list by design, so `--auto` correctly merges PRs
+even when `auto-bump` shows `action_required`. The visible red
+on every PR is misleading.
+
+Conventions for the `n3ary/gtfs-publisher` repo (and any other repo
+where `auto-bump` runs):
+- Wait for `mergeStateStatus == CLEAN` in `gh pr view`.
+- Use plain `gh pr merge --squash --delete-branch`. No `--auto`.
+- Print the `statusCheckRollup` before merging so the human can
+  see which checks passed.
+- The visible red `auto-bump` cycle resolves once the repo's
+  branch protection lists `github-actions[bot]` as a bypass
+  actor (one-time web UI change per repo).
+
 ## Consumers
 
 - [`n3ary/app`](https://github.com/n3ary/app) - the consumer PWA
