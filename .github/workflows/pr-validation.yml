@@ -1,4 +1,4 @@
-name: PR Validation (shared base)
+name: '[check] PR validation (callable)'
 
 # Reusable workflow. Consumers call it from their own
 # `.github/workflows/<name>.yml`:

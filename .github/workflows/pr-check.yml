@@ -1,4 +1,4 @@
-name: PR Check (shared wrapper)
+name: '[check] PR check (callable)'
 
 # Reusable workflow. Consumers call this from their own
 # `.github/workflows/pr-check.yml` instead of calling

@@ -1,4 +1,4 @@
-name: Check Standards Drift
+name: '[check] standards drift (callable)'
 
 # Reusable workflow. Consumers call it as a job from their own
 # `.github/workflows/<name>.yml`:
