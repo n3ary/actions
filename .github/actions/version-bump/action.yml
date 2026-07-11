@@ -1,26 +1,18 @@
-name: 'Auto-bump version on PR'
-description: 'Bumps package.json#version on the PR branch, either auto-incrementing from main+1 (default) or to an explicit override (version-input). Preserves pre-release tags and commits pnpm-lock.yaml if dirty. Returns the bumped version + whether anything actually changed.'
+name: 'Bump version to a specific target (publish flow)'
+description: 'Bumps package.json#version to a caller-supplied target (version-input), commits, pushes, and optionally tags. Used by the package/publish + adapters/publish composite actions. The pr-bump auto-increment mode is REMOVED - use n3ary/release-bot for auto-bumping on PR merge.'
 author: 'n3ary'
 
 inputs:
-  bump-skip-paths:
-    description: 'Comma-separated paths that, when changed alone, should skip the bump. Ignored when version-input is set.'
-    required: false
-    default: '.github/,docs/,.gitignore,LICENSE'
+  version-input:
+    description: 'REQUIRED. Explicit target version (e.g. "0.3.4"). Bumps to this value. The action fails if this is empty - auto-bump on PR is handled by n3ary/release-bot, not this action.'
+    required: true
+    default: ''
   commit-message:
     description: 'Commit message. {version} is replaced with the new version. Ignored when commit-message-override is set.'
     required: false
-    default: 'chore(release): auto-bump to v{version}'
+    default: 'chore(release): v{version}'
   commit-message-override:
     description: 'Full commit message override. Ignored when unset. Useful for publish flows that want a custom message.'
-    required: false
-    default: ''
-  base-ref:
-    description: 'Base ref to compare against. Defaults to the workflow base ref.'
-    required: false
-    default: ''
-  version-input:
-    description: 'Explicit target version (e.g. "0.3.4"). When set, skips auto-increment and uses this value. Used by publish flows (publish-spec, adapters/publish) that need a precise target rather than main+1. Ignores bump-skip-paths.'
     required: false
     default: ''
   package-dir:
@@ -31,9 +23,9 @@ inputs:
     description: >-
       If set, creates a git tag with this name on the bump commit and
       pushes it to origin. Supports the {version} placeholder (e.g.
-      'packages/spec/v{version}'). When unset, no tag is created -
-      this is the auto-bump-on-PR default. Used by publish flows that
-      need a tag to trigger a downstream publish job.
+      'packages/spec/v{version}'). When unset, no tag is created.
+      Used by publish flows that need a tag to trigger a downstream
+      publish job.
     required: false
     default: ''
   skip-commit:
@@ -43,83 +35,54 @@ inputs:
 
 outputs:
   previous-version:
-    description: 'The version on origin/<base> before the bump (or current version when version-input is set and matches).'
+    description: 'The version in package.json before the bump (or current version when version-input matches current).'
   next-version:
     description: 'The version after the bump (matches the new package.json#version).'
   bumped:
-    description: '"true" if the version was bumped; "false" if skipped (metadata-only diff, already correct, or version-input matched current).'
-  skipped:
-    description: '"true" if the action skipped (metadata-only diff OR version-input matched current).'
+    description: '"true" if the version was bumped; "false" if skipped (already at target).'
+  tag:
+    description: 'The tag name pushed (empty if tag-name input was unset).'
 
 runs:
   using: composite
   steps:
-    - name: Skip if metadata-only diff
-      id: skip-check
-      if: inputs.version-input == ''
+    - name: Validate inputs
+      id: validate
       shell: bash
       env:
-        BUMP_SKIP_PATHS: ${{ inputs.bump-skip-paths }}
+        VERSION_INPUT: ${{ inputs.version-input }}
       run: |
-        BASE="${BASE_REF:-${GITHUB_BASE_REF:-main}}"
-        CHANGED=$(git diff --name-only "origin/${BASE}"...HEAD)
-        SKIP_RE=$(printf '%s' "$BUMP_SKIP_PATHS" | tr ',' '\n' | sed 's:.*:^&:; s:/$::' | paste -sd'|' -)
-        NON_META=$(echo "$CHANGED" | grep -vE "$SKIP_RE" || true)
-        if [ -z "$NON_META" ]; then
-          echo "Only metadata changes — skipping version bump."
-          echo "skip=true" >> "$GITHUB_OUTPUT"
-        else
-          echo "skip=false" >> "$GITHUB_OUTPUT"
+        if [ -z "$VERSION_INPUT" ]; then
+          cat <<'EOF' >&2
+::error::version-input is required. The pr-bump auto-increment mode has been removed from this action - n3ary/release-bot handles auto-bumps on PR merge. This action is now publish-only: callers must pass an explicit target version. If you are wiring this into a workflow, pass `version-input: <semver-string>`.
+EOF
+          exit 1
         fi
 
     - name: Compute target version
       id: compute
-      if: steps.skip-check.outputs.skip != 'true'
       shell: bash
       env:
         VERSION_INPUT: ${{ inputs.version-input }}
         PACKAGE_DIR: ${{ inputs.package-dir }}
       run: |
         PKG_JSON="${PACKAGE_DIR:-.}/package.json"
-        if [ -n "$VERSION_INPUT" ]; then
-          # Validate semver-ish format. Matches the check in publish-spec
-          # + adapters/publish so the contract is consistent.
-          if ! echo "$VERSION_INPUT" | grep -qE \
-              '^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$'; then
-            echo "::error::Invalid version-input format: $VERSION_INPUT"
-            echo "Expected: e.g. 0.1.0, 0.2.0-rc.1, 1.0.0-alpha.1"
-            exit 1
-          fi
-          TARGET="$VERSION_INPUT"
-          CURRENT=$(node -p "require('./${PKG_JSON}').version")
-          echo "version-input: $TARGET (current: $CURRENT, pkg: $PKG_JSON)"
-        else
-          BASE="${BASE_REF:-${GITHUB_BASE_REF:-main}}"
-          MAIN_VERSION=$(git show "origin/${BASE}:${PKG_JSON}" | \
-            node -p "JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).version")
-          # Increment patch; preserve pre-release suffix.
-          # Handles: 1.5.68 -> 1.5.69, 0.2.0-m1 -> 0.2.1-m1,
-          # 1.0.0-alpha.1 -> 1.0.1-alpha.1,
-          # 0.2.0-rc.1+build.5 -> 0.2.1-rc.1+build.5.
-          TARGET=$(node -e '
-            const v = process.argv[1].match(/^(\d+)\.(\d+)\.(\d+)(-.+)?$/);
-            if (!v) {
-              console.error("Unparseable version:", process.argv[1]);
-              process.exit(1);
-            }
-            const [, major, minor, patchStr, prerelease = ""] = v;
-            console.log(`${major}.${minor}.${Number(patchStr) + 1}${prerelease}`);
-          ' "$MAIN_VERSION")
-          CURRENT=$(node -p "require('./${PKG_JSON}').version")
-          echo "Auto-bump: $MAIN_VERSION -> $TARGET (PR branch: $CURRENT, pkg: $PKG_JSON)"
+        if ! echo "$VERSION_INPUT" | grep -qE \
+            '^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$'; then
+          echo "::error::Invalid version-input format: $VERSION_INPUT"
+          echo "Expected: e.g. 0.1.0, 0.2.0-rc.1, 1.0.0-alpha.1"
+          exit 1
         fi
+        TARGET="$VERSION_INPUT"
+        CURRENT=$(node -p "require('./${PKG_JSON}').version")
+        echo "version-input: $TARGET (current: $CURRENT, pkg: $PKG_JSON)"
         echo "previous=$CURRENT" >> "$GITHUB_OUTPUT"
         echo "next=$TARGET" >> "$GITHUB_OUTPUT"
         echo "package_dir=$PKG_JSON" >> "$GITHUB_OUTPUT"
 
     - name: Apply bump (commit + push)
       id: apply
-      if: steps.skip-check.outputs.skip != 'true' && inputs.skip-commit != 'true'
+      if: inputs.skip-commit != 'true'
       shell: bash
       env:
         COMMIT_MSG_OVERRIDE: ${{ inputs.commit-message-override }}
@@ -200,17 +163,3 @@ runs:
         fi
 
         echo "bumped=true" >> "$GITHUB_OUTPUT"
-        echo "skipped=false" >> "$GITHUB_OUTPUT"
-
-    - name: Mark as skipped
-      if: steps.skip-check.outputs.skip == 'true'
-      shell: bash
-      env:
-        PACKAGE_DIR: ${{ inputs.package-dir }}
-      run: |
-        PKG_JSON="${PACKAGE_DIR:-.}/package.json"
-        CURRENT=$(node -p "require('./${PKG_JSON}').version" 2>/dev/null || echo "")
-        echo "previous=${CURRENT}" >> "$GITHUB_OUTPUT"
-        echo "next=${CURRENT}" >> "$GITHUB_OUTPUT"
-        echo "bumped=false" >> "$GITHUB_OUTPUT"
-        echo "skipped=true" >> "$GITHUB_OUTPUT"
