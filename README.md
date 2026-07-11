@@ -5,7 +5,7 @@ Composite GitHub Actions and reusable workflows for the [n3ary org](https://gith
 
 | Action | Description |
 |---|---|
-| [version-bump](.github/actions/version-bump) | Bumps `package.json#version` on the PR branch to `main + 1`. Handles pre-release tags. |
+| [version-bump](.github/actions/version-bump) | Publish-only. Bumps `package.json#version` to a caller-supplied target, commits, pushes, optionally tags. **Not** for auto-bumping on PR — use [n3ary/release-bot](https://github.com/n3ary/release-bot) for that. |
 | [ascii-commits](.github/actions/ascii-commits) | Fails the build if any commit message (subject + body) on the PR branch, or the PR title, contains non-ASCII characters. |
 
 ## Reusable workflows
